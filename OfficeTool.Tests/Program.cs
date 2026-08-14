@@ -644,7 +644,7 @@ static class Program
                 "Then: slide 1 cover title 'Quarterly Review', " +
                 "slide 2 three stat callouts about revenue, costs, outlook, slide 3 a closing shape with text 'Thank you'. " +
                 "Then Save().",
-                new[] { typeof(OfficeTool) },
+                new[] { "OfficeTool" },
                 maxIterations: 40));
             var result = task.GetAwaiter().GetResult();
             Console.WriteLine($"\nAgent final message:\n{result.Message}\n");
@@ -706,7 +706,7 @@ static class Program
                 "two charts with titles and named series (month revenue and product share), a Data sheet with " +
                 "the imported CSV (freeze, autofilter, conditional formatting on Profit and Achievement%), " +
                 "tab colors, and activeTab set to the Dashboard sheet. Then Save().",
-                new[] { typeof(OfficeTool) },
+                new[] { "OfficeTool" },
                 maxIterations: 80));
             var result = task.GetAwaiter().GetResult();
             Console.WriteLine($"\nAgent final message:\n{result.Message}\n");
