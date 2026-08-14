@@ -1,0 +1,7 @@
+bin/
+obj/
+*.user
+.vs/
+*.nupkg
+out/
+sync-gap-report.md
