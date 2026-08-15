@@ -226,7 +226,7 @@ later decision (kept for history).
 `[active]`
 - `OfficeTool.Tests` runs in `%TEMP%` on purpose: the repo sits under OneDrive and test files
   written under the repo got cloud-synced on every Create/Save (the historical hour-long runs).
-- The agent scenarios (`--agent`, `--agent-dashboard`) drive the REAL AgentOrchestrator loop
+- The agent scenarios (`--agent`, `--agent-dashboard`) drive the REAL AgentHarness loop
   against DeepSeekBridge and verify the produced documents (deck slides, dashboard KPIs/charts/
   activeTab/tabColor).
 

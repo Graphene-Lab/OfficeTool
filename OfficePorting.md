@@ -362,7 +362,7 @@ elenca i formati e i comandi disponibili.
 dove gira l'agente: disponibile solo quando l'utente è davanti a un desktop locale.
 Design:
 
-- `ExecuteAction` (AgentOrchestrator.cs#332) riceve un nuovo parametro opzionale
+- `ExecuteAction` (AgentHarness.cs#332) riceve un nuovo parametro opzionale
   **`bool isLocalUser = false`** — default false (safe). Il check "sistema desktop"
   NON è del chiamante: è interno a `ExecuteAction`:
   `watchAllowed = isLocalUser && IsInteractiveDesktopSession()`, con
@@ -560,7 +560,7 @@ mutazioni, poi L3 e produzione. Questo implementa la progressione L1→L2→L3.
 
 - Aggiungere `typeof(AIOrchestrator.API.OfficeTool)` all'array `agentTypes` dei host
   (es. `AIOffice\Panels\Agent.cs` riga 44 e `AIOffice\Panels\Voice.cs` righe 92-96).
-- In `AgentOrchestrator.cs` (~riga 617), il guard `requiresFileTools` deve includere
+- In `AgentHarness.cs` (~riga 617), il guard `requiresFileTools` deve includere
   `t == typeof(API.OfficeTool)`.
 - Gli host desktop passano `isLocalUser: true` a `ExecuteAction`/`ExecuteActionStream`
   (abilita i metodi Watch di OfficeTool, v. §3); l'API di AgentBridge lo deriva dall'IP
@@ -597,7 +597,7 @@ mutazioni, poi L3 e produzione. Questo implementa la progressione L1→L2→L3.
 - **Parità CLI**: per i metodi principali, eseguire lo stesso scenario via officecli
   binario e via `OfficeTool` e confrontare i risultati (documenti generati + output JSON).
 - **Sandbox**: test di confine (sibling-prefix, `..`, path Windows assoluti) come nel
-  test 16 di AgentOrchestrator.Tests.
+  test 16 di AgentHarness.Tests.
 
 ---
 
