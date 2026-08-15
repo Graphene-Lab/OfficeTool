@@ -1,13 +1,15 @@
 # Files/dirs excluded from the vendored copy of upstream OfficeCLI.
 # Deletions are the ONLY allowed divergence from upstream (see VENDOR.md).
-# One glob per line, relative to the upstream project root (src/officecli/...).
+# One glob per line, relative to the officecli PROJECT ROOT (the folder that
+# contains the upstream src/officecli tree after vendoring, e.g.
+# ExternalDependencies/officecli/).
 
 # CLI entry point (the only removed .cs file: forces an Exe output).
-src/officecli/Program.cs
+Program.cs
 
 # Build artifacts (never copied).
-src/officecli/bin/
-src/officecli/obj/
+bin/
+obj/
 
 # Repo metadata (not part of the build).
-src/officecli/.git/
+.git/

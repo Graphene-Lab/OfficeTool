@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <OutputType>Library</OutputType>
     <TargetFramework>net10.0</TargetFramework>
     <RootNamespace>OfficeCli</RootNamespace>
     <AssemblyName>officecli</AssemblyName>
@@ -10,10 +10,6 @@
     <Company>OfficeCLI</Company>
     <Copyright>Copyright © 2026 OfficeCLI (https://OfficeCLI.AI)</Copyright>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
-    <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>true</SelfContained>
-    <PublishTrimmed>true</PublishTrimmed>
-    <CETCompat>false</CETCompat>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
@@ -55,4 +51,13 @@
     <EmbeddedResource Include="..\..\schemas\help\**\*.json" LogicalName="schemas/help/%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 
+
+  <ItemGroup>
+    <!-- Friend assemblies: the adapter plugin and its test harness use internal engine
+         APIs (Watch*, TemplateMerger, SchemaHelpLoader, SkillInstaller, CommandBuilder,
+         BatchTypes, ...). This grant + the Exe->Library conversion are the ONLY changes
+         to the vendored project; the engine sources stay byte-identical to upstream. -->
+    <InternalsVisibleTo Include="OfficeTool" />
+    <InternalsVisibleTo Include="OfficeTool.Tests" />
+  </ItemGroup>
 </Project>

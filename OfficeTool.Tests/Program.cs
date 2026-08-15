@@ -32,6 +32,10 @@ static class Program
     {
         if (args.Contains("--agent")) return RunAgentScenario();
         if (args.Contains("--agent-dashboard")) return RunAgentDashboardScenario();
+        if (args.Contains("--agent-suite")) return RunAgentSuite();
+        if (args.Contains("--agent-view")) return RunAgentView();
+        if (args.Contains("--skill-dump")) return RunSkillDump();
+        if (args.Contains("--suite-verify")) return RunSuiteVerifyOnly();
 
         _range = ParseRange(Arg(args, "--range"));
         _filter = Arg(args, "--filter");
@@ -116,7 +120,7 @@ static class Program
     static void RunSmoke(OfficeTool tool)
     {
         // docx core workflow
-        Check("docx Create", tool.Create("/doc.docx"));
+        Check("docx Create", tool.Create("/doc.docx").StartsWith("Created"));
         var p1 = tool.Add("/body", "paragraph", new[] { "text=Hello World" });
         Check("docx Add paragraph → path returned", p1.StartsWith("Added /body/p") && !p1.Contains("Error"));
         Check("docx Get text", NodeText(tool.Get("/body/p[1]")) == "Hello World");
@@ -130,7 +134,7 @@ static class Program
         Check("docx Get missing path → Error", tool.Get("/body/p[999]").StartsWith("Error:"));
 
         // xlsx core workflow
-        Check("xlsx Create", tool.Create("/book.xlsx"));
+        Check("xlsx Create", tool.Create("/book.xlsx").StartsWith("Created"));
         var items = Enumerable.Range(1, 60)
             .Select(i => $"{{\"command\":\"set\",\"path\":\"/Sheet1/A{i}\",\"props\":{{\"value\":\"{i * 2}\"}}}}");
         var batch = Parse(tool.Batch("[" + string.Join(",", items) + "]"));
@@ -140,7 +144,7 @@ static class Program
         Check("xlsx Save backup", tool.Save().Contains(".001.bak"));
 
         // pptx core workflow
-        Check("pptx Create", tool.Create("/deck.pptx"));
+        Check("pptx Create", tool.Create("/deck.pptx").StartsWith("Created"));
         Check("pptx Add slide → /slide[1]", tool.Add("/", "slide").Contains("/slide[1]"));
         Check("pptx Add second slide", tool.Add("/", "slide").Contains("/slide[2]"));
         var shp = tool.Add("/slide[1]", "shape", new[] { "text=Title", "x=1cm", "y=1cm", "w=10cm", "h=3cm" });
@@ -149,6 +153,7 @@ static class Program
 
         // guards
         Check("No document open guard", new OfficeTool().Get("/x").Contains("No document open"));
+        Check("docx Open missing -> Error", new OfficeTool().Open("/nope-missing.docx").StartsWith("Error:"));
     }
 
     static void RunGolden(OfficeTool tool)
@@ -158,7 +163,7 @@ static class Program
         // vendor sync (update-officecli.ps1).
 
         // word/document-formatting.md — document-level property round-trip
-        Check("golden docx create", tool.Create("/gold.docx"));
+        Check("golden docx create", tool.Create("/gold.docx").StartsWith("Created"));
         var setDoc = tool.Set("/", new[]
         {
             "author=Jane Author", "title=Q3 Field Report",
@@ -175,7 +180,7 @@ static class Program
         Check("golden docx validate OK", tool.Validate().StartsWith("{") && !tool.Validate().Contains("Error"));
 
         // excel/cell-formatting.md — cell property surface
-        Check("golden xlsx create", tool.Create("/gold.xlsx"));
+        Check("golden xlsx create", tool.Create("/gold.xlsx").StartsWith("Created"));
         Check("golden xlsx set cell font", tool.Set("/Sheet1/B1", new[]
         {
             "value=Bold + italic + blue + 14pt",
@@ -192,7 +197,7 @@ static class Program
         Check("golden xlsx get value", NodeText(tool.Get("/Sheet1/B1")) == "Bold + italic + blue + 14pt");
 
         // ppt/tables/tables-basic.md — table surface (data= CSV, per-cell set)
-        Check("golden pptx create", tool.Create("/gold.pptx"));
+        Check("golden pptx create", tool.Create("/gold.pptx").StartsWith("Created"));
         tool.Add("/", "slide");
         var tbl = tool.Add("/slide[1]", "table", new[]
         {
@@ -214,7 +219,7 @@ static class Program
         // Self-contained: creates its own files, so --group view works standalone.
         tool.Create("/view.docx");
         tool.Add("/body", "paragraph", new[] { "text=Hello World" });
-        Check("view docx reopen", tool.Open("/view.docx"));
+        Check("view docx reopen", tool.Open("/view.docx").StartsWith("Opened"));
         Check("view docx ViewOutline is JSON", tool.ViewOutline().StartsWith("{") && tool.ViewOutline().Contains("\"paragraphs\""));
         Check("view docx ViewStats is JSON", tool.ViewStats().StartsWith("{") && !tool.ViewStats().Contains("Error"));
         Check("view docx ViewAnnotated text", tool.ViewAnnotated().Contains("Hello World"));
@@ -227,16 +232,54 @@ static class Program
         tool.Set("/Sheet1/A1", new[] { "value=10" });
         Check("view xlsx ViewText range", tool.ViewText(range: "Sheet1!A1:B3").StartsWith("{"));
         Check("view xlsx ViewText cols", tool.ViewText(cols: new[] { "A" }).StartsWith("{"));
+        // G11: query --compact on xlsx is rejected with the vendor error (parity)
+        Check("view xlsx Query compact → Error (vendor parity)", tool.Query("row[1]", compact: true).StartsWith("Error:"));
         tool.Create("/view.pptx");
         tool.Add("/", "slide");
-        var svg = tool.ViewSvg(1);
+        tool.Add("/slide[1]", "shape", new[] { "text=compact probe", "x=1in", "y=2in", "w=3in", "h=0.5in" });
+        // G11: query --compact + --fields (vendor parity)
+        var compact = tool.Query("shape", compact: true);
+        Check("view pptx Query compact → total line + probe", compact.Contains("total:") && compact.Contains("compact probe"));
+        var compactFields = tool.Query("shape", compact: true, fields: "x,y");
+        Check("view pptx Query compact+fields → x= y= columns", compactFields.Contains("x=") && compactFields.Contains("y="));
+        var svg = tool.ViewSvg("1");
         Check("view pptx ViewSvg → SVG markup", svg.StartsWith("<svg") || svg.Contains("<svg"));
-        Check("view pptx ViewSvg out-of-range → Error", tool.ViewSvg(99).StartsWith("Error:"));
+        Check("view pptx ViewSvg out-of-range → Error", tool.ViewSvg("99").StartsWith("Error:"));
+        Check("view pptx ViewSvg invalid page → Error", tool.ViewSvg("abc").StartsWith("Error:"));
+        // G-alignment: get --save (binary extraction of embedded media, vendor parity)
+        var pngB64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        File.WriteAllBytes(Path.Combine(_workspace, "pix.png"), Convert.FromBase64String(pngB64));
+        tool.Create("/save.pptx");
+        tool.Add("/", "slide");
+        tool.Add("/slide[1]", "shape", new[] { "text=hello" });
+        var addPic = tool.Add("/slide[1]", "picture", new[] { "src=/pix.png" });
+        Check("view pptx picture add with workspace src", addPic.StartsWith("Added") && !addPic.Contains("Error"));
+        var picPath = addPic.Replace("Added ", "").TrimEnd('.');
+        var extracted = tool.Get(picPath, save: "/out/pix_out.png");
+        Check("view pptx get --save extracts bytes", extracted.StartsWith("Extracted") && File.Exists(Path.Combine(_workspace, "out", "pix_out.png")));
+        Check("view pptx get --save no payload -> Error", tool.Get("/slide[1]/shape[1]", save: "/out/x.png").StartsWith("Error:"));
+        // G-alignment: view screenshot --grid (thumbnail contact sheet, pptx)
+        tool.Create("/grid.pptx");
+        tool.Add("/", "slide");
+        tool.Add("/slide[1]", "shape", new[] { "text=grid probe" });
+        var gridShot = tool.ViewScreenshot("/out/grid.png", grid: "auto");
+        Check("view pptx ViewScreenshot grid -> png or browser-missing error", gridShot.Contains(".png") || gridShot.Contains("Error"));
+        Check("view pptx ViewScreenshot grid invalid -> Error", tool.ViewScreenshot("/out/g.png", grid: "bogus").StartsWith("Error:"));
         var shot = tool.ViewScreenshot("/shot.png");
         Check("view ViewScreenshot → png path or browser-missing error", shot.Contains(".png") || shot.Contains("Error"));
+        // G4: omitted path must land inside the workspace under /out/, agent path returned, no host path leak
+        var shotDefault = tool.ViewScreenshot();
+        Check("view ViewScreenshot default → /out/ workspace path, no host leak",
+            shotDefault.Contains("Error") || (shotDefault.StartsWith("Screenshot saved to '/out/") && !shotDefault.Contains("\\")));
         Check("view Watch gated by default", tool.Watch().Contains("local desktop session"));
-        Check("view Unwatch without watch", tool.Unwatch().Contains("No watch is running"));
+        Check("view Unwatch without watch", tool.Unwatch().StartsWith("Error:") && tool.Unwatch().Contains("No watch is running"));
         Check("view GetSelected gated", tool.GetSelected().Contains("local desktop session"));
+        // G-alignment: remove --shift (Excel cell shift-delete, vendor parity)
+        tool.Create("/shift.xlsx");
+        tool.Batch("[{\"command\":\"set\",\"path\":\"/Sheet1/A1\",\"props\":{\"value\":\"one\"}},{\"command\":\"set\",\"path\":\"/Sheet1/B1\",\"props\":{\"value\":\"two\"}}]");
+        Check("view xlsx Remove shift=left -> cell shifts", tool.Remove("/Sheet1/A1", shift: "left").StartsWith("Removed") && tool.Get("/Sheet1/A1").Contains("two"));
+        Check("view xlsx Remove shift bad path -> Error", tool.Remove("/Sheet1", shift: "left").StartsWith("Error:"));
+        Check("view xlsx Remove shift on non-cell -> Error", tool.Remove("/Sheet1/row[1]", shift: "up").StartsWith("Error:") || tool.Remove("/Sheet1/row[1]", shift: "up").Contains("single-cell"));
     }
 
     static void RunEdits(OfficeTool tool)
@@ -246,11 +289,27 @@ static class Program
         tool.Add("/body", "paragraph", new[] { "text=Hello World" });
         Check("edits docx Swap", tool.Swap("/body/p[1]", "/body/p[1]").StartsWith("Swapped"));
         Check("edits docx Query selector", !tool.Query("paragraph").Contains("Error"));
+        // G11: query --find filter (vendor parity)
+        Check("edits docx Query find → subset", tool.Query("paragraph", find: "Hello").Contains("Hello"));
+        var findNone = Parse(tool.Query("paragraph", find: "NoSuchTextXYZ"));
+        Check("edits docx Query find → 0 matches", findNone?["matches"]?.GetValue<int>() == 0);
         var raw = tool.Raw("/word/document.xml");
         Check("edits docx Raw part", raw.Contains("<w:document"));
         var dump = tool.Dump("/");
         Check("edits docx Dump → batch JSON with meta", dump.StartsWith("[{\"command\":\"meta\"") || dump.Contains("\"command\":\"meta\""));
-        Check("edits docx Create template", tool.Create("/tpl.docx"));
+        var replaced = tool.Set("/", null, "Hello World", "Goodbye World");
+        Check("edits docx Set find/replace → match count", replaced.Contains("1 matched"));
+        Check("edits docx Set find/replace applied", tool.ViewText().Contains("Goodbye World"));
+        Check("edits docx Set find/replace conflict → Error", tool.Set("/", new[] { "find=X" }, "X", "Y").StartsWith("Error:"));
+        Check("edits docx Set find/replace no match → warning", tool.Set("/", null, "NoSuchTextXYZ", "Y").Contains("matched 0 occurrences"));
+        // G2: Create over an existing file must back it up first (Backup-Before-Write policy)
+        tool.Create("/g2.docx");
+        tool.Add("/body", "paragraph", new[] { "text=precious content" });
+        tool.Save();
+        var recreate = tool.Create("/g2.docx");
+        Check("edits docx Create overwrite → backup info", recreate.Contains("backed up as 'g2."));
+        Check("edits docx Create overwrite → Restore recovers", tool.Restore().Contains("restored") && tool.ViewText().Contains("precious content"));
+        Check("edits docx Create template", tool.Create("/tpl.docx").StartsWith("Created"));
         Check("edits docx template placeholder", tool.Add("/body", "paragraph", new[] { "text=Hello {{name}}" }).StartsWith("Added /body/p"));
         tool.Save();
         var merged = tool.Merge("/tpl.docx", "/merged.docx", "{\"name\":\"World\"}");
@@ -260,12 +319,42 @@ static class Program
         tool.Add("/", "slide");
         tool.Add("/", "slide");
         Check("edits pptx Swap slides", tool.Swap("/slide[1]", "/slide[2]").StartsWith("Swapped"));
+        // G-alignment: document protection gate (vendor --force parity on add/set/batch)
+        tool.Create("/prot.docx");
+        tool.Add("/body", "paragraph", new[] { "text=hello" });
+        var protSet = tool.Set("/", new[] { "protection=readOnly" });
+        var protEnforced = tool.Get("/").Contains("protectionEnforced");
+        var block = tool.Set("/body/p[1]", new[] { "text=blocked" });
+        var forced = tool.Set("/body/p[1]", new[] { "text=forced" }, force: true);
+        var blockAdd = tool.Add("/body", "paragraph", new[] { "text=blocked-add" });
+        var forcedAdd = tool.Add("/body", "paragraph", new[] { "text=forced-add" }, force: true);
+        var blockBatch = tool.Batch("[{\"command\":\"set\",\"path\":\"/body/p[1]\",\"props\":{\"text\":\"x\"}}]");
+        Check("edits protection engages (protection prop sticks)", protEnforced);
+        Check("edits protection Set blocked without force", block.StartsWith("Error:") && block.Contains("protected"));
+        Check("edits protection Set allowed with force", forced.StartsWith("Updated"));
+        Check("edits protection Add blocked without force", blockAdd.StartsWith("Error:") && blockAdd.Contains("protected"));
+        Check("edits protection Add allowed with force", forcedAdd.StartsWith("Added"));
+        Check("edits protection Batch blocked without force", blockBatch.Contains("protected"));
     }
 
     static void RunSkills(OfficeTool tool)
     {
         var skill = tool.LoadSkill("pitch-deck");
+        // G5 v2: quote-aware translation (props with spaces, in-quote ; and >, view flags, lifecycle verbs)
+        var wordSkill = tool.LoadSkill("word");
+        Check("skills translation quoted props balanced", wordSkill.Contains("props: [\"text=Q4 2026 Review\", \"style=Heading1\""));
+        Check("skills translation view text flags", wordSkill.Contains("ViewText(startLine: 1, endLine: 80)"));
+        Check("skills translation border prop (in-quote ;)", wordSkill.Contains("Set(\"/body/p[3]\", props: [\"pbdr.bottom=single;6;2E75B6\"])"));
+        Check("skills translation selector (in-quote >)", wordSkill.Contains("Query(\"paragraph[size>=24pt]\")"));
+        Check("skills translation lifecycle verbs", wordSkill.Contains("Save()") && wordSkill.Contains("Validate()") && wordSkill.Contains("Help(\"docx\")"));
+        Check("skills translation dual-naming note", wordSkill.Contains("snake_case (view_outline)"));
+        var pptxSkill = tool.LoadSkill("pptx");
+        Check("skills translation svg --start 3 --end 3 -> ViewSvg(\"3\")", pptxSkill.Contains("ViewSvg(\"3\")"));
         Check("skills LoadSkill pitch-deck", skill.Contains("#") && !skill.Contains("Error"));
+        // G5: on-the-fly CLI-to-method translation (clean lines rewritten, shell lines untouched, note prepended)
+        Check("skills translation clean add", skill.Contains("Add(\"/\", \"slide\", props: [\"layout=blank\", \"background=1E2761\"])"));
+        Check("skills translation pipes untouched", skill.Contains("| jq"));
+        Check("skills translation note", skill.Contains("translated lines below"));
         Check("skills LoadSkill null → catalog", tool.LoadSkill().Contains("pitch-deck"));
         Check("skills LoadSkill unknown → Error with list", tool.LoadSkill("bogus").StartsWith("Error: Unknown skill"));
         Check("skills LoadSkill /path → file", tool.LoadSkill("/pitch-deck/SKILL.md").Contains("#"));
@@ -327,7 +416,7 @@ static class Program
         var skill = tool.LoadSkill("data-dashboard");
         Check("dashboard skill data-dashboard loads", skill.Contains("Dashboard") && !skill.Contains("Error"));
 
-        Check("dashboard Create", tool.Create("/dashboard.xlsx"));
+        Check("dashboard Create", tool.Create("/dashboard.xlsx").StartsWith("Created"));
         var imp1 = tool.Import("/Sheet1", dataCsv, header: true);
         Check("dashboard import 20 sales rows", imp1.Contains("8 cols"));
         Check("dashboard rename Sheet1 to Data", tool.Set("/Sheet1", new[] { "name=Data" }).StartsWith("Updated"));
@@ -424,7 +513,7 @@ static class Program
         Check("dashboard 2 CF rules", cfQ?["results"] is JsonArray cfa && cfa.Count >= 2);
         Check("dashboard Get activeTab", tool.Get("/").Contains("activeTab"));
 
-        Check("dashboard reopen", tool.Open("/dashboard.xlsx"));
+        Check("dashboard reopen", tool.Open("/dashboard.xlsx").StartsWith("Opened"));
         Check("dashboard 4 sheets after reopen", tool.Query("sheet").Contains("Dashboard") && tool.Query("sheet").Contains("Rankings"));
     }
 
@@ -434,7 +523,7 @@ static class Program
         // workflow): full-bleed navy cover with big title (>=36pt) + gold accent
         // bar, a stats slide with three callout cards, and a closing slide.
         // Palette: 1B365D navy / 4472C4 blue / FFC000 gold / F0F4FF card / 666666 label.
-        Check("office Create deck", tool.Create("/deck.pptx"));
+        Check("office Create deck", tool.Create("/deck.pptx").StartsWith("Created"));
         for (var s = 1; s <= 3; s++)
             Check($"office add slide {s}", tool.Add("/", "slide").Contains($"/slide[{s}]"));
 
@@ -487,7 +576,10 @@ static class Program
         { "text=Questions welcome", "size=18pt", "color=8FAADC", "align=center",
           "x=0", "y=3.55in", "w=13.33in", "h=0.6in" });
 
-        Check("office Save", tool.Save().Contains(".001.bak"));
+        // The backup number is not fixed: /deck.pptx was already created by RunSmoke in the
+        // same run, and Create() now backs up an existing file before overwriting it (G2) —
+        // so by the time Save() runs, the numbering may start at .002.bak or later.
+        Check("office Save", tool.Save().Contains(".bak"));
         Check("office Validate", tool.Validate().StartsWith("{") && !tool.Validate().Contains("Error"));
         var outline = Parse(tool.ViewOutline());
         Check("office outline 3 slides", outline?["totalSlides"]?.GetValue<int>() == 3);
@@ -495,8 +587,8 @@ static class Program
         Check("office cover big title + brand", slide1.Contains("44pt") && slide1.Contains("Strategy Review") && slide1.Contains("1B365D"));
         var shapes = Parse(tool.Query("shape"));
         Check("office 14+ shapes", shapes?["results"] is JsonArray sa && sa.Count >= 14);
-        Check("office ViewSvg slide 1", tool.ViewSvg(1).Contains("<svg"));
-        Check("office reopen", tool.Open("/deck.pptx") && Parse(tool.ViewOutline())?["totalSlides"]?.GetValue<int>() == 3);
+        Check("office ViewSvg slide 1", tool.ViewSvg("1").Contains("<svg"));
+        Check("office reopen", tool.Open("/deck.pptx").StartsWith("Opened") && Parse(tool.ViewOutline())?["totalSlides"]?.GetValue<int>() == 3);
     }
 
     static void RunWord(OfficeTool tool)
@@ -506,7 +598,7 @@ static class Program
         // explicit sizes, a bulleted list, a styled data table and a footer with
         // a live page-number field. Palette: 1B365D navy / 1F6FEB accent /
         // 666666 label — the same family as the dashboard and deck demos.
-        Check("word Create demo", tool.Create("/demo.docx"));
+        Check("word Create demo", tool.Create("/demo.docx").StartsWith("Created"));
 
         var setDoc = tool.Set("/", new[]
         {
@@ -566,10 +658,12 @@ static class Program
         var outline = tool.ViewOutline();
         Check("word outline", outline.Contains("Highlights") && outline.Contains("Quarterly Results"));
         Check("word stats", tool.ViewStats().StartsWith("{") && !tool.ViewStats().Contains("Error"));
+        var statsPc = tool.ViewStats(pageCount: true);
+        Check("word stats pageCount", statsPc.Contains("pages") || statsPc.StartsWith("Error:"));
         var tblQ = Parse(tool.Query("table"));
         Check("word 1 table", tblQ?["results"] is JsonArray ta && ta.Count == 1);
         Check("word bullets text", tool.Query("paragraph").Contains("Enterprise renewals up 24%"));
-        Check("word reopen", tool.Open("/demo.docx") && tool.Query("paragraph").Contains("Highlights"));
+        Check("word reopen", tool.Open("/demo.docx").StartsWith("Opened") && tool.Query("paragraph").Contains("Highlights"));
     }
 
     static void RunHelp(OfficeTool tool)
@@ -657,7 +751,7 @@ static class Program
                 return 1;
             }
             using var tool = new OfficeTool();
-            var ok = tool.Open("/deck.pptx");
+            var ok = tool.Open("/deck.pptx").StartsWith("Opened");
             Console.WriteLine(ok ? "✓ reopened deck.pptx" : "✗ cannot reopen deck.pptx");
             var outline = Parse(tool.ViewOutline());
             var slides = outline?["totalSlides"]?.GetValue<int>() ?? 0;
@@ -722,7 +816,7 @@ static class Program
             Console.WriteLine($"✓ dashboard.xlsx produced ({new FileInfo(file).Length} bytes)");
 
             using var tool = new OfficeTool();
-            var ok = tool.Open("/dashboard.xlsx");
+            var ok = tool.Open("/dashboard.xlsx").StartsWith("Opened");
             if (!ok) { Console.WriteLine("✗ cannot reopen dashboard.xlsx"); return 1; }
             var sheets = tool.Query("sheet");
             Console.WriteLine($"Sheets: {sheets.Contains("Dashboard")} — Dashboard present: {sheets.Contains("Dashboard")}");
@@ -775,5 +869,362 @@ static class Program
         {
             orch.Dispose();
         }
+    }
+
+
+    /// <summary>
+    /// Dumps EXACTLY what the agent sees for OfficeTool in both interaction modes and runs
+    /// deterministic doc-quality checks: API mode (Analyzer.GeToolDefinitions - one JSON tool
+    /// per method, markdown + scheme, built from the XML docs) and CLI mode (Terminal.GetToolPrompt -
+    /// the allowed-command block). The dumps land in out/agent-view-*.md for human review; the
+    /// checks fail on doc regressions that would deceive the agent (missing summaries, type leaks,
+    /// sandbox mentions, host paths, stub text).
+    /// </summary>
+    static int RunAgentView()
+    {
+        Log.IsEnabled = true;
+        var outDir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "out"));
+        Directory.CreateDirectory(outDir);
+
+        var apiView = UISupportGeneric.Analyzer.GeToolDefinitions(typeof(OfficeTool));
+        var cliView = UISupportGeneric.Terminal.GetToolPrompt(new[] { typeof(OfficeTool) });
+        File.WriteAllText(Path.Combine(outDir, "agent-view-api.md"), apiView);
+        File.WriteAllText(Path.Combine(outDir, "agent-view-cli.md"), cliView);
+        Console.WriteLine($"agent-view: API dump ({apiView.Length} chars) -> out/agent-view-api.md");
+        Console.WriteLine($"agent-view: CLI dump ({cliView.Length} chars) -> out/agent-view-cli.md");
+
+        var expected = new[] { "Help", "LoadSkill", "ViewSvg", "ViewScreenshot", "GetMarks", "Unmark", "Mark",
+            "Goto", "Unwatch", "Watch", "Import", "Dump", "Merge", "ViewHtml", "AddPart", "RawSet", "Raw",
+            "Batch", "Swap", "Move", "Remove", "Add", "Set", "Query", "GetSelected", "Get", "ViewForms",
+            "Validate", "ViewIssues", "ViewStats", "ViewAnnotated", "ViewText", "ViewOutline", "Restore",
+            "Save", "Create", "Open" };
+        var methods = UISupportGeneric.Util.GetCallableMethods(typeof(OfficeTool)).ToList();
+        Check("agent-view surface count = 37", methods.Count == expected.Length);
+        foreach (var name in expected)
+        {
+            Check("agent-view api method " + name, apiView.Contains("\"method\": \"" + Snake(name) + "\""));
+            Check("agent-view cli method " + name, cliView.Contains(name));
+        }
+        var subLine = cliView.Split('\n').FirstOrDefault(l => l.TrimStart().StartsWith("Subcommands: "))?.Trim();
+        Check("agent-view cli subcommands complete",
+            subLine != null && expected.All(n => subLine.Contains(n)) && subLine.Count(ch => ch == ',') + 1 == expected.Length);
+        var nonString = methods.Where(m => m.ReturnType != typeof(string)).Select(m => m.Name + ":" + m.ReturnType.Name).ToList();
+        if (nonString.Count > 0) Console.WriteLine("  non-string returns: " + string.Join(", ", nonString));
+        Check("agent-view every method returns string (conversational contract)", nonString.Count == 0);
+
+        // doc-quality guards - text that would deceive the agent
+        var surface = apiView + "\n" + cliView;
+        Check("agent-view no missing-summary fallback", !apiView.Contains("API call."));
+        Check("agent-view no sandbox mention", !surface.Contains("sandbox", StringComparison.OrdinalIgnoreCase));
+        Check("agent-view no stub markers",
+            !System.Text.RegularExpressions.Regex.IsMatch(surface, "(?i)\\b(TODO|FIXME|XXX|stub|not implemented)\\b"));
+        Check("agent-view no C# type leaks",
+            !System.Text.RegularExpressions.Regex.IsMatch(surface, "string\\[\\]|List<|Dictionary<|System\\."));
+        Check("agent-view no host backslash paths",
+            !System.Text.RegularExpressions.Regex.IsMatch(surface, "[A-Za-z]:\\\\"));
+
+        Console.WriteLine("\n" + new string('=', 10) + " " + (_failures == 0 ? "ALL TESTS PASSED" : $"{_failures} FAILURE(S)") + " " + new string('=', 10));
+        Console.WriteLine($"executed {_total} check(s) · skipped {_skipped}");
+        return _failures == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// Writes every vendored skill EXACTLY as the agent receives it (after the G5 on-the-fly
+    /// translation) to out/agent-skills/&lt;name&gt;.md, plus a per-skill line count, so the
+    /// skill content can be reviewed from the agent's point of view.
+    /// </summary>
+    static int RunSkillDump()
+    {
+        Log.IsEnabled = true;
+        var outDir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "out", "agent-skills"));
+        Directory.CreateDirectory(outDir);
+        var tool = new OfficeTool();
+        var names = new[] { "word", "excel", "pptx", "pitch-deck", "word-form", "academic-paper", "data-dashboard", "financial-model", "morph-ppt", "morph-ppt-3d" };
+        foreach (var n in names)
+        {
+            var content = tool.LoadSkill(n);
+            if (content.StartsWith("Error:")) { Console.WriteLine("skill-dump " + n + ": " + content); continue; }
+            File.WriteAllText(Path.Combine(outDir, n + ".md"), content);
+            var lines = content.Split('\n');
+            var methodish = lines.Count(l =>
+                (l.Contains("(") && (l.Contains("View") || l.Contains("Get") || l.Contains("Set") || l.Contains("Add") || l.Contains("Remove") || l.Contains("Query")))
+                && !l.TrimStart().StartsWith("//") && !l.TrimStart().StartsWith("#"));
+            Console.WriteLine("skill-dump " + n + ": " + lines.Length + " lines, ~" + methodish + " method-call lines");
+        }
+        Console.WriteLine("skill-dump: written to out/agent-skills/");
+        return 0;
+    }
+
+
+    /// <summary>
+    /// LLM scenario suite: 3 sophisticated agent-driven document builds (Word report,
+    /// multi-sheet xlsx budget model, 7-slide pptx deck), monitored live via AgentProgress
+    /// (per-iteration method names to console + results file) and verified afterwards on
+    /// the produced artifacts. Needs DeepSeekBridge on 127.0.0.1:8787.
+    /// </summary>
+    static int RunAgentSuite()
+    {
+        Console.WriteLine("╔══════════════════════════════════════════════════════════╗");
+        Console.WriteLine("║  OfficeTool — agent suite: word + multi-sheet xlsx +       ║");
+        Console.WriteLine("║  7-slide pptx (live monitoring, artifact verification)     ║");
+        Console.WriteLine("╚══════════════════════════════════════════════════════════╝");
+        Log.IsEnabled = true;
+        Log.LogStep("=== OfficeTool.Tests agent suite (word + xlsx + pptx) ===");
+
+        var providerName = "DeepSeekBridge";
+        _workspace = Path.Combine(Path.GetTempPath(), "OfficeTool.Tests-workspace");
+        if (Directory.Exists(_workspace)) Directory.Delete(_workspace, recursive: true);
+        Directory.CreateDirectory(_workspace);
+        Setup.SkipIndexingOnStartup = true;
+        Setup.DocumentsPath = _workspace;
+        Setup.ProviderConfig = ProviderConfigs.Get(providerName);
+
+        var resultsFile = Path.Combine(Path.GetTempPath(), "officetool_agent_suite_results.txt");
+        File.WriteAllText(resultsFile, $"RUN {DateTime.Now:HH:mm:ss}\n");
+        File.AppendAllText(resultsFile, "STARTED\n");
+
+        int pass = 0, total = 0;
+
+        // T1 — Word business report
+        total++;
+        if (RunSuiteScenario(1, "Word business report", resultsFile,
+            "Create a professional Word business report '/report.docx' with OfficeTool. " +
+            "FIRST call LoadSkill(\"word\") and follow its workflow: clear heading hierarchy, " +
+            "explicit heading sizes, one body font, footer with live page field. " +
+            "Then complete ALL tasks in order:\n" +
+            "TASK 1: Create the document.\n" +
+            "TASK 2: Add title 'Q2 2026 Business Review' (style=Title, bold, centered, ~32pt).\n" +
+            "TASK 3: Add 'Executive Summary' as Heading1 with 3 bullet paragraphs (revenue growth, EMEA expansion, cost control).\n" +
+            "TASK 4: Add 'Financial Highlights' as Heading1 with a 4x3 table (header: Metric, Q1, Q2; rows: Revenue, Costs, Profit) with plausible numbers.\n" +
+            "TASK 5: Add 'Next Steps' as Heading1 with a numbered list of 3 actions.\n" +
+            "TASK 6: Set page A4 portrait with 2cm margins.\n" +
+            "TASK 7: Add a default footer with a live page-number field (field=page, align=center, size=9pt).\n" +
+            "TASK 8: Save().\n",
+            "/report.docx",
+            verify: t =>
+            {
+                var outline = t.ViewOutline();
+                if (!outline.Contains("Executive Summary")) return "missing heading 'Executive Summary'";
+                if (!outline.Contains("Financial Highlights")) return "missing heading 'Financial Highlights'";
+                if (Parse(t.Query("table"))?["results"] is not JsonArray { Count: > 0 }) return "no table found";
+                if (Parse(t.Query("paragraph[listStyle=bullet]"))?["results"] is not JsonArray { Count: >= 3 }) return "bullet list not found";
+                if (t.Get("/footer[1]", 3).StartsWith("Error")) return "footer missing";
+                return t.Validate().Contains("\"errors\":[]") ? null : "validate not clean";
+            })) pass++;
+
+        // T2 — multi-sheet xlsx budget model
+        total++;
+        if (RunSuiteScenario(2, "XLSX multi-sheet budget model", resultsFile,
+            "Build a multi-sheet financial budget workbook '/budget.xlsx' with OfficeTool. " +
+            "FIRST call LoadSkill(\"excel\") and follow its workflow: formulas not hardcoded values, " +
+            "explicit column widths, professional font, zero formula errors. " +
+            "Then complete ALL tasks in order:\n" +
+            "TASK 1: Create the workbook.\n" +
+            "TASK 2: Sheet 'Assumptions': blue input cells — growth rate 10% and tax rate 25%.\n" +
+            "TASK 3: Sheet 'Revenue': 12 monthly revenue values for 2026 (labels in A, values in B).\n" +
+            "TASK 4: Sheet 'Summary' with KPI cells computed by FORMULA referencing the other sheets: " +
+            "Total Revenue =SUM(Revenue!B2:B13), Total Cost, Profit, Profit Margin (%); set currency and percent number formats.\n" +
+            "TASK 5: Format all sheets: header rows bold with fill, column widths (labels 22, numbers 14).\n" +
+            "TASK 6: Add a chart on Summary showing monthly revenue.\n" +
+            "TASK 7: Save().\n",
+            "/budget.xlsx",
+            verify: t =>
+            {
+                var sheets = t.Query("sheet");
+                if (!sheets.Contains("Assumptions") || !sheets.Contains("Revenue") || !sheets.Contains("Summary"))
+                    return "one of Assumptions/Revenue/Summary missing: " + sheets;
+                if (Parse(t.Query("Summary!:has(formula)"))?["results"] is not JsonArray { Count: >= 3 })
+                    return "Summary has too few formula cells";
+                if (Parse(t.Query("chart"))?["results"] is not JsonArray { Count: > 0 }) return "no chart found";
+                return t.Validate().Contains("\"errors\":[]") ? null : "validate not clean";
+            })) pass++;
+
+        // T3 — pptx 7-slide investor deck
+        total++;
+        if (RunSuiteScenario(3, "PPTX 7-slide investor deck", resultsFile,
+            "Build a 7-slide investor presentation '/deck.pptx' with OfficeTool. " +
+            "FIRST call LoadSkill(\"pptx\") and follow its layout rules: title >= 36pt, body >= 18pt, " +
+            "one idea per slide, speaker notes on content slides, edge margin >= 1.27cm. " +
+            "Then complete ALL tasks in order:\n" +
+            "TASK 1: Create the presentation.\n" +
+            "TASK 2: Slide 1 cover: title 'Growth Equity Fund' + subtitle 'Q2 2026 Update' (title >= 36pt bold).\n" +
+            "TASK 3: Slide 2 agenda: title 'Agenda' + 4 bullets (Market, Portfolio, Financials, Outlook).\n" +
+            "TASK 4: Slide 3 'Market Opportunity': title + 3 bullets (TAM, growth drivers, whitespace).\n" +
+            "TASK 5: Slide 4 'Portfolio Highlights': title + 3 bullets.\n" +
+            "TASK 6: Slide 5 'Financial Performance': title + 3 stat shapes (Revenue $48M, Growth 18%, Margin 35%).\n" +
+            "TASK 7: Slide 6 '2026 Outlook': title + 3 bullets.\n" +
+            "TASK 8: Slide 7 closing: title 'Thank You' + subtitle.\n" +
+            "TASK 9: Add speaker notes to content slides (3-6).\n" +
+            "TASK 10: Save().\n",
+            "/deck.pptx",
+            verify: t =>
+            {
+                var outline = Parse(t.ViewOutline());
+                var slides = outline?["totalSlides"]?.GetValue<int>() ?? 0;
+                if (slides != 7) return $"expected 7 slides, got {slides}";
+                return t.Validate().Contains("\"errors\":[]") ? null : "validate not clean";
+            })) pass++;
+
+        Console.WriteLine($"\n══════════ agent suite: {pass}/{total} passed ══════════");
+        File.AppendAllText(resultsFile, $"DONE {pass}/{total} passed, {total - pass} failed\n");
+        Console.WriteLine($"Results file: {resultsFile}");
+        return pass == total ? 0 : 1;
+    }
+
+    /// <summary>Runs one agent suite scenario: subscribes to AgentProgress for a live
+    /// per-iteration trace (console + results file), drives ExecuteAction, then verifies
+    /// the produced artifact with a fresh OfficeTool instance. Returns true on PASS.</summary>
+    static bool RunSuiteScenario(int num, string name, string resultsFile, string prompt,
+        string expectedFile, Func<OfficeTool, string?> verify)
+    {
+        Console.WriteLine($"\n── T{num}: {name} ──");
+        var orch = new AgentOrchestrator("DeepSeekBridge");
+        AgentOrchestrator.AgentProgressEventArgs? final = null;
+        using var done = new ManualResetEventSlim();
+        orch.AgentProgress += (_, e) =>
+        {
+            if (e.State == AgentOrchestrator.AgentState.Iteration)
+            {
+                var line = $"[it{e.Iteration}] {e.MethodName}";
+                Console.WriteLine("  " + line);
+                File.AppendAllText(resultsFile, $"T{num} {line}\n");
+            }
+            else if (e.State is AgentOrchestrator.AgentState.Completed
+                or AgentOrchestrator.AgentState.Failed)
+            { final = e; done.Set(); }
+        };
+        try
+        {
+            var task = Task.Run(() => orch.ExecuteAction(prompt, new[] { "OfficeTool" }, maxIterations: 90));
+            done.Wait(TimeSpan.FromSeconds(300));
+            var result = task.GetAwaiter().GetResult();
+            File.AppendAllText(resultsFile, $"T{num} EVENT:{final?.State} ITERS:{result.Iterations} MS:{result.TotalElapsedMs}\n");
+            Console.WriteLine($"  outcome: {(result.Success ? "SUCCESS" : result.Code)} ({result.Iterations} iters, {result.TotalElapsedMs / 1000}s)");
+
+            if (!result.Success)
+            {
+                File.AppendAllText(resultsFile, $"T{num} FAIL agent: {result.Error}\n");
+                Console.WriteLine($"  FAIL: agent error: {result.Error}");
+                return false;
+            }
+            if (!File.Exists(Path.Combine(_workspace, expectedFile.TrimStart('/'))))
+            {
+                File.AppendAllText(resultsFile, $"T{num} FAIL file-not-created\n");
+                Console.WriteLine($"  FAIL: '{expectedFile}' not produced");
+                return false;
+            }
+            using var tool = new OfficeTool();
+            var openResult = tool.Open(expectedFile);
+            if (openResult.StartsWith("Error"))
+            {
+                File.AppendAllText(resultsFile, $"T{num} FAIL cannot-open\n");
+                Console.WriteLine($"  FAIL: cannot reopen: {openResult}");
+                return false;
+            }
+            var problem = verify(tool);
+            if (problem != null)
+            {
+                File.AppendAllText(resultsFile, $"T{num} FAIL verify: {problem}\n");
+                Console.WriteLine($"  FAIL: verify: {problem}");
+                return false;
+            }
+            File.AppendAllText(resultsFile, $"T{num} PASS iters:{result.Iterations} ms:{result.TotalElapsedMs}\n");
+            Console.WriteLine($"  PASS ✓");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            File.AppendAllText(resultsFile, $"T{num} CRASH {ex.GetType().Name}: {ex.Message}\n");
+            Console.WriteLine($"  FAIL: {ex.GetType().Name}: {ex.Message}");
+            return false;
+        }
+        finally { orch.Dispose(); }
+    }
+
+
+    /// <summary>
+    /// Deterministic re-verification of the last agent-suite run: opens the 3 artifacts
+    /// produced in the suite workspace and runs the same verify checks the suite uses
+    /// (no LLM, no new document build). Exit 0 only when all checks pass.
+    /// </summary>
+    static int RunSuiteVerifyOnly()
+    {
+        Console.WriteLine("══ OfficeTool — suite artifact re-verification (no LLM) ══");
+        Log.IsEnabled = true;
+        Log.LogStep("=== OfficeTool.Tests suite verify-only (existing artifacts) ===");
+        _workspace = Path.Combine(Path.GetTempPath(), "OfficeTool.Tests-workspace");
+        Setup.SkipIndexingOnStartup = true;
+        Setup.DocumentsPath = _workspace;
+
+        var checks = new (int Num, string Name, string File, Func<OfficeTool, string?> Verify)[]
+        {
+            (1, "Word business report", "report.docx", t =>
+            {
+                var outline = t.ViewOutline();
+                if (!outline.Contains("Executive Summary")) return "missing heading 'Executive Summary'";
+                if (!outline.Contains("Financial Highlights")) return "missing heading 'Financial Highlights'";
+                if (Parse(t.Query("table"))?["results"] is not JsonArray { Count: > 0 }) return "no table found";
+                if (Parse(t.Query("paragraph[listStyle=bullet]"))?["results"] is not JsonArray { Count: >= 3 }) return "bullet list not found";
+                if (t.Get("/footer[1]", 3).StartsWith("Error")) return "footer missing";
+                return t.Validate().Contains("\"errors\":[]") ? null : "validate not clean";
+            }),
+            (2, "XLSX multi-sheet budget model", "budget.xlsx", t =>
+            {
+                var sheets = t.Query("sheet");
+                if (!sheets.Contains("Assumptions") || !sheets.Contains("Revenue") || !sheets.Contains("Summary"))
+                    return "one of Assumptions/Revenue/Summary missing: " + sheets;
+                if (Parse(t.Query("Summary!:has(formula)"))?["results"] is not JsonArray { Count: >= 3 })
+                    return "Summary has too few formula cells";
+                if (Parse(t.Query("chart"))?["results"] is not JsonArray { Count: > 0 }) return "no chart found";
+                return t.Validate().Contains("\"errors\":[]") ? null : "validate not clean";
+            }),
+            (3, "PPTX 7-slide investor deck", "deck.pptx", t =>
+            {
+                var outline = Parse(t.ViewOutline());
+                var slides = outline?["totalSlides"]?.GetValue<int>() ?? 0;
+                if (slides != 7) return $"expected 7 slides, got {slides}";
+                return t.Validate().Contains("\"errors\":[]") ? null : "validate not clean";
+            }),
+        };
+
+        int pass = 0;
+        foreach (var c in checks)
+        {
+            Console.Write($"T{c.Num}: {c.Name}... ");
+            var path = Path.Combine(_workspace, c.File);
+            if (!File.Exists(path))
+            {
+                Console.WriteLine($"FAIL — {c.File} missing");
+                continue;
+            }
+            using var tool = new OfficeTool();
+            var openResult = tool.Open("/" + c.File);
+            if (openResult.StartsWith("Error"))
+            {
+                Console.WriteLine($"FAIL — cannot open: {openResult}");
+                continue;
+            }
+            var problem = c.Verify(tool);
+            if (problem != null)
+            {
+                Console.WriteLine($"FAIL — {problem}");
+                continue;
+            }
+            Console.WriteLine("PASS ✓");
+            pass++;
+        }
+        Console.WriteLine($"\n══════════ verify-only: {pass}/{checks.Length} passed ══════════");
+        return pass == checks.Length ? 0 : 1;
+    }
+
+    static string Snake(string name)
+    {
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < name.Length; i++)
+        {
+            if (char.IsUpper(name[i])) { if (i > 0) sb.Append('_'); sb.Append(char.ToLowerInvariant(name[i])); }
+            else sb.Append(name[i]);
+        }
+        return sb.ToString();
     }
 }

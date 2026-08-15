@@ -5,3 +5,5 @@ obj/
 *.nupkg
 out/
 sync-gap-report.md
+# Pristine upstream csproj saved by the sync for the resource-parity reference
+ExternalDependencies/officecli/officecli.csproj.upstream

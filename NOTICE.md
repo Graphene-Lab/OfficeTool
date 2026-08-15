@@ -11,7 +11,8 @@ This package contains a vendored copy of the **OfficeCLI** engine
 **Apache License, Version 2.0**.
 
 The vendored source is kept byte-identical to upstream (only the CLI entry point
-`Program.cs` is omitted; see `VENDOR.md` and `sync-exclude.txt` for the sync
+`Program.cs` is omitted and the project file is converted from console to Library
+with `InternalsVisibleTo`; see `VENDOR.md` and `sync-exclude.txt` for the sync
 procedure and fidelity rules).
 
 ## Apache License, Version 2.0

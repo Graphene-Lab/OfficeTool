@@ -1,5 +1,23 @@
 # OfficePorting — Linee guida per convertire officecli in OfficeTool.cs
 
+> **Aggiornamento 2026-08-14 — OfficeTool è un adapter minimale.** L'engine vendored
+> NON è più compilato nello stesso assembly del plugin: `ExternalDependencies/officecli`
+> è un **progetto Library separato** (sempre dentro il repo, ProjectReference da
+> `OfficeTool.csproj` con `PrivateAssets=all`). Lo script di sync converte il
+> `officecli.csproj` upstream da console a Library (`OutputType` + `InternalsVisibleTo`
+> a `OfficeTool`/`OfficeTool.Tests`) — l'unica modifica strutturale al vendor, che
+> altrimenti resta byte-identical. `OfficeTool.cs` è ora il **minimal adapter**: stato
+> (handler/watch/backup), `Dispose`, helper e niente codice engine; la **superficie
+> public (metodi + XML docs) è rigenerata da `update-vendor.ps1`** in modo
+> deterministico: analisi dei comandi CLI del vendor (`CommandBuilder*.cs` + view
+> modes + `load_skill`) → template dei metodi incorporati nello script → blocco tra i
+> marcatori `@@ADAPTER_SURFACE_BEGIN/END`. Un metodo viene emesso solo se il suo
+> comando/modo esiste nel vendor; comandi nuovi senza template finiscono nel report.
+> L'adapter accede agli internal dell'engine via `InternalsVisibleTo` (Watch*,
+> TemplateMerger, SchemaHelpLoader, SkillInstaller, CommandBuilder, BatchTypes...) e,
+> se un domani servisse un membro privato, via reflection — il confine sandbox
+> (`SandboxPath.Resolve`/`ToAgent`) è preservato in ogni metodo generato.
+
 > **Aggiornamento 2026-08-14 — OfficeTool è un plugin.** `OfficeTool.cs` non vive più in
 > `AIOrchestrator\API`: è migrato nel repo `Graphene-Lab/OfficeTool` (pacchetto NuGet
 > `Graphene.OfficeTool`), caricato dinamicamente dalla cartella `Tools/` degli host
@@ -290,7 +308,7 @@ Classe: `public class OfficeTool : BaseAgentTool, IDisposable, ILocalDesktopCapa
 | Comando | Metodo |
 |---|---|
 | `get <file> <path> --depth N` | `Get(string path, int depth = 1)` |
-| `query <file> <selector>` | `Query(string selector)` |
+| `query <file> <selector>` | `Query(string selector, string? find = null, bool compact = false, string? fields = null)` — parità totale: `--find` (filtro testo), `--compact` (formato riga) e `--fields` (colonne extra) implementati via `AdapterSupport.Query` sullo stesso motore del vendor (`AttributeFilter.FilterSelector` + `FormatNodesCompact`); envelope JSON `{matches, results, warnings?}` |
 | `set <file> <path> --prop ...` | `Set(string path, string[]? props = null, string? find = null, string? replace = null)` |
 | `add <file> <parent> --type T --prop ... [--after/--before/--index/--from]` | `Add(string parentPath, string type, string[]? props = null, string? after = null, string? before = null, int? index = null, string? from = null)` |
 | `remove <file> <path>` | `Remove(string path, string[]? props = null)` (`--shift left\|up` xlsx) |
