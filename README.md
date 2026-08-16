@@ -1,12 +1,12 @@
 # OfficeTool
 
-Agent tool for Office documents (DOCX / XLSX / PPTX) used by [AIOrchestrator](https://github.com/Graphene-Lab/AIOrchestrator):
+Agent tool for Office documents (DOCX / XLSX / PPTX) used by [AIOrchestrator](https://github.com/Graphene-Lab/AgentHarness):
 create/open, view (outline/text/annotated/stats/issues), path-based DOM get/query/set/add/remove/move/swap,
 validate, batch, schema-driven help, template merge, save/restore — one document open at a time.
 
 The class `AIOrchestrator.API.OfficeTool` is an **agent tool**: its public methods become
 LLM-callable tools via reflection + XML docs (see `OfficePorting.md` and the
-[Agent Tools Guide](https://github.com/Graphene-Lab/AIOrchestrator/blob/master/API/AGENT_TOOLS_GUIDE.md)).
+[Agent Tools Guide](https://github.com/Graphene-Lab/AgentHarness/blob/master/API/AGENT_TOOLS_GUIDE.md)).
 
 It is a **plugin**: hosts load it dynamically from their `Tools/` folder (startup scan +
 hot-add watcher) — see the plugin architecture doc shipped with AIOffice
