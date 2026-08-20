@@ -10,9 +10,9 @@ namespace AIOrchestrator.API
 {
     /// <summary>
     /// Office document (DOCX/XLSX/PPTX) operations for agent use: create/open, view (outline/text/annotated/stats/issues),
-    /// get/query (path-based DOM), set/add/remove/move/swap, validate, batch, schema help, save/restore.
-    /// ONE document open at a time: Open()/Create() replaces the current one; Create() backs up an existing
-    /// file before overwriting it; Save() persists with a numbered backup, Restore() reverts to the most recent backup.
+    /// get/query (path-based DOM), set/add/remove/move/swap, validate, batch, schema help, save.
+    /// ONE document open at a time: Open()/Create() replaces the current one. Every save creates a new
+    /// version in the workspace git repo (rollback via GitTool.restore).
     /// File paths are Unix-style relative to the workspace root (leading "/") — never escape it.
     /// Document paths use officecli syntax (e.g. /slide[1]/shape[2], 1-based); Get()/Query() produce them.
     /// Call Help(format, element) first when unsure about property names or value formats.
@@ -48,8 +48,8 @@ namespace AIOrchestrator.API
 
         /// <summary>
         /// Explicit interface implementation — NOT an agent tool (the orchestrator disposes agents
-        /// automatically when the loop ends). Persists any unsaved changes first (with a numbered backup),
-        /// then releases the document handler.
+        /// automatically when the loop ends). Persists any unsaved changes first (with automatic
+        /// versioning), then releases the document handler.
         /// </summary>
         void IDisposable.Dispose()
         {
@@ -57,11 +57,11 @@ namespace AIOrchestrator.API
             {
                 if (_handler != null && !string.IsNullOrEmpty(_filePath))
                 {
-                    var backupName = CreateBackup(_filePath);
                     _handler.Save();
-                    Log.LogStep(backupName == null
-                        ? $"OfficeTool.Dispose: auto-saved '{_filePath}' (new file, no backup)"
-                        : $"OfficeTool.Dispose: auto-saved '{_filePath}' (backup '{backupName}')");
+                    var versionId = GitSupport.Snapshot(_filePath, "OfficeTool auto-save");
+                    Log.LogStep(versionId != null
+                        ? $"OfficeTool.Dispose: auto-saved '{_filePath}' (version '{versionId}')"
+                        : $"OfficeTool.Dispose: auto-saved '{_filePath}' (no changes)");
                 }
             }
             catch (Exception ex)
@@ -944,67 +944,59 @@ namespace AIOrchestrator.API
         }
 
         /// <summary>
-        /// Restores the document to its state from the most recent backup (.bak file).
-        /// The current (modified) document is replaced with the backup copy, and the backup file
-        /// is preserved (not deleted) for future rollbacks.
-        /// </summary>
-        /// <returns>A message describing the restore result.</returns>
-        public string Restore()
-        {
-            if (_handler == null) return NoDocumentError;
-            try
-            {
-                var dir = Path.GetDirectoryName(_filePath) ?? ".";
-                var nameWithoutExt = Path.GetFileNameWithoutExtension(_filePath);
-                var backupFiles = Directory.GetFiles(dir, $"{nameWithoutExt}.*.bak")
-                    .OrderByDescending(f => f)
-                    .ToList();
-                if (backupFiles.Count == 0)
-                    return "No backup file found. The document was never saved with backup enabled.";
-                var latestBackup = backupFiles[0];
-                var backupName = Path.GetFileName(latestBackup);
-                _handler.Dispose();
-                File.Copy(latestBackup, _filePath, overwrite: true);
-                _handler = DocumentHandlerFactory.Open(_filePath, editable: true);
-                Log.LogStep($"OfficeTool.Restore: restored '{_filePath}' from '{backupName}'");
-                return $"Document restored from backup '{backupName}'. The backup file has been preserved.";
-            }
-            catch (CliException ex) { return FormatCliError(ex); }
-            catch (Exception ex) { Log.LogStep($"OfficeTool.Restore: FAILED — {ex.Message}"); return $"Error: Restore failed: {ex.Message}"; }
-        }
-
-        /// <summary>
         /// Writes all pending changes to the current file path — an explicit checkpoint.
-        /// Before saving, creates a numbered backup of the existing file (.001.bak, .002.bak, ...)
-        /// so the original state can be restored later via <see cref="Restore"/>.
+        /// The new content becomes a new version in the workspace git repo (rollback via GitTool.restore).
         /// </summary>
-        /// <returns>A message with the backup file name, or an "Error:" string when no document is open.</returns>
+        /// <returns>A message with the new version id, or an "Error:" string when no document is open.</returns>
         public string Save()
         {
             if (_handler == null) return NoDocumentError;
             try
             {
-                var backupName = CreateBackup(_filePath);
                 _handler.Save();
-                Log.LogStep($"OfficeTool.Save: saved '{_filePath}', backup='{backupName}'");
+                var versionId = GitSupport.Snapshot(_filePath, "OfficeTool save");
+                Log.LogStep($"OfficeTool.Save: saved '{_filePath}', version='{versionId}'");
                 var agentPath = SandboxPath.ToAgent(_filePath);
-                return backupName == null
-                    ? $"Document saved to '{agentPath}'. (New file, no backup needed.)"
-                    : $"Document saved to '{agentPath}'. The previous version was backed up as '{backupName}'.";
+                return versionId != null
+                    ? $"Document saved to '{agentPath}'. New version: {versionId}. (Rollback via GitTool.restore.)"
+                    : $"Document saved to '{agentPath}'. (No changes detected.)";
             }
             catch (CliException ex) { return FormatCliError(ex); }
             catch (Exception ex) { Log.LogStep($"OfficeTool.Save: FAILED — {ex.Message}"); return $"Error: Save failed: {ex.Message}"; }
         }
 
+        /// <summary>Reverts the OPEN document to a version from the workspace git repo (list them with
+        /// GitTool.history). The current state is saved as a new version first (the rollback is
+        /// reversible), then the file is overwritten and the document is reloaded. Use this when the
+        /// document is open in this tool; GitTool.restore handles files that are not open.</summary>
+        /// <param name="versionId">Version to restore, from GitTool.history().</param>
+        /// <returns>Descriptive result message.</returns>
+        public string Restore(string versionId)
+        {
+            if (_handler == null) return NoDocumentError;
+            try
+            {
+                _handler.Dispose();   // release the open handle so the file can be overwritten
+                var message = GitSupport.Restore(versionId, _filePath);
+                _handler = DocumentHandlerFactory.Open(_filePath, editable: true);
+                return message;
+            }
+            catch (CliException ex) { return FormatCliError(ex); }
+            catch (Exception ex)
+            {
+                Log.LogStep($"OfficeTool.Restore: FAILED — {ex.Message}");
+                return $"Error: Restore failed: {ex.Message}";
+            }
+        }
+
         /// <summary>
         /// Creates a new blank Office document (docx/xlsx/pptx) on THIS instance and saves it.
         /// The format is determined by the file extension. If the target file already exists,
-        /// it is backed up (numbered .bak) before being overwritten — Restore() recovers it.
+        /// it is overwritten and the new content becomes a new version (GitTool.restore recovers the old one).
         /// </summary>
         /// <param name="filePath">Path where the new document is saved (Unix style, e.g. "/folder/deck.pptx"),
         /// relative to the workspace root. Extension must be .docx, .xlsx or .pptx.</param>
-        /// <returns>"Created '&lt;path&gt;'." plus the backup name when an existing file was overwritten,
-        /// or "Error:".</returns>
+        /// <returns>"Created '&lt;path&gt;'." plus the new version id, or "Error:".</returns>
         public string Create(string filePath)
         {
             try
@@ -1014,17 +1006,15 @@ namespace AIOrchestrator.API
                 if (ext is not (".docx" or ".xlsx" or ".pptx"))
                     return $"Error: Unsupported extension '{ext}' — use .docx, .xlsx or .pptx.";
                 _handler?.Dispose();
-                var backupName = CreateBackup(resolved);
                 BlankDocCreator.Create(resolved, locale: null, minimal: false);
                 _handler = DocumentHandlerFactory.Open(resolved, editable: true);
                 _filePath = resolved;
-                Log.LogStep(backupName == null
-                    ? $"OfficeTool.Create: created '{resolved}'"
-                    : $"OfficeTool.Create: created '{resolved}' (backed up existing as '{backupName}')");
+                var versionId = GitSupport.Snapshot(resolved, "OfficeTool create");
+                Log.LogStep($"OfficeTool.Create: created '{resolved}' version='{versionId}'");
                 var agentPath = SandboxPath.ToAgent(resolved);
-                return backupName == null
-                    ? $"Created '{agentPath}'."
-                    : $"Created '{agentPath}'. The previous version was backed up as '{backupName}'.";
+                return versionId != null
+                    ? $"Created '{agentPath}'. New version: {versionId}."
+                    : $"Created '{agentPath}'.";
             }
             catch (Exception ex)
             {
@@ -1176,27 +1166,6 @@ namespace AIOrchestrator.API
                 options = new OfficeCli.Core.Rendering.RenderOptions { PageFilter = page };
             }
             return options;
-        }
-
-        /// <summary>Creates a numbered backup of the specified file (pattern filename.NNN.bak, never overwrites).</summary>
-        private static string? CreateBackup(string filePath)
-        {
-            if (!File.Exists(filePath)) return null;
-            var dir = Path.GetDirectoryName(filePath) ?? ".";
-            var nameWithoutExt = Path.GetFileNameWithoutExtension(filePath);
-            for (int i = 1; i <= 9999; i++)
-            {
-                var backupName = $"{nameWithoutExt}.{i:D3}.bak";
-                if (!File.Exists(Path.Combine(dir, backupName)))
-                {
-                    File.Copy(filePath, Path.Combine(dir, backupName));
-                    return backupName;
-                }
-            }
-            var ts = DateTime.Now.ToString("yyyyMMddHHmmss");
-            var fallbackName = $"{nameWithoutExt}.{ts}.bak";
-            File.Copy(filePath, Path.Combine(dir, fallbackName));
-            return fallbackName;
         }
     }
 }
