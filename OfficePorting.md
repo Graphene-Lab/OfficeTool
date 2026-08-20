@@ -1,5 +1,11 @@
 # OfficePorting — Linee guida per convertire officecli in OfficeTool.cs
 
+> **Aggiornamento 2026-08-20 — il backup `.NNN.bak` è stato sostituito dal versioning git.**
+> Le sezioni di questo documento che descrivono "backup numerato" / `Restore()` dal backup
+> sono **storiche**: oggi ogni `Save()`/`Create()` versiona il nuovo contenuto nel repo git
+> del workspace (`GitSupport.Snapshot`) e il rollback è centralizzato in `Restore(versionId)`
+> / `GitTool.restore`. Vedi AGENT_TOOLS_GUIDE.md → "Version-Before-Write".
+
 > **Aggiornamento 2026-08-14 — OfficeTool è un adapter minimale.** L'engine vendored
 > NON è più compilato nello stesso assembly del plugin: `ExternalDependencies/officecli`
 > è un **progetto Library separato** (sempre dentro il repo, ProjectReference da

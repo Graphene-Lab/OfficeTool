@@ -144,11 +144,14 @@ later decision (kept for history).
   check WARNs and the params degrade gracefully. `LastFindMatchCount` removal would fail the build.
 
 ### D14. Create Backup-Before-Write (G2, 2026-08-15)
-`[active]`
+`[superseded 2026-08-20 — replaced by git versioning (GitSupport/GitTool)]`
 - `Create` over an existing file makes a numbered backup first (`CreateBackup`) and returns
   `"Created '<path>'. The previous version was backed up as '<name>'."`; `Restore()` recovers it.
 - **Why**: guide policy "Backup-Before-Write"; the vendor CLI truncates, but an autonomous agent
   must never destroy content silently.
+- **Superseded**: the `.NNN.bak` policy was replaced by version-on-save in the workspace git
+  repo (`GitSupport.Snapshot`); rollback is centralized in the tool's `Restore(versionId)` and
+  `GitTool.restore`. See AGENT_TOOLS_GUIDE.md → "Version-Before-Write".
 
 ### D15. Query full vendor parity (G11, 2026-08-15)
 `[active]`

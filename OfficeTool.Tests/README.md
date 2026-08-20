@@ -3,7 +3,7 @@
 Harness end-to-end per `OfficeTool` (`OfficeTool.cs` nel repo plugin, stesso repo dell'engine
 vendored). Esegue operazioni
 reali su file docx/xlsx/pptx in una sandbox e verifica i risultati agent-facing
-(envelope JSON, stringhe di errore officecli, backup/restore, help embedded).
+(envelope JSON, stringhe di errore officecli, versioning/rollback, help embedded).
 
 ## Regola d'oro
 
@@ -19,7 +19,7 @@ pochi secondi in una attesa inutile.
 
 | Gruppo | Contenuto | Quando si lancia |
 |---|---|---|
-| `smoke` (default) | Flusso core per formato (docx/xlsx/pptx: create→add→get→save→restore) + guardie base | **Sempre** (default, nessun argomento) — pochi secondi |
+| `smoke` (default) | Flusso core per formato (docx/xlsx/pptx: create→add→get→save→rollback) + guardie base | **Sempre** (default, nessun argomento) — pochi secondi |
 | `golden` | Regression vendor: le stesse sequenze di `examples/` dell'upstream (document props, cell formatting, tables) | **Dopo ogni sync vendor** (`update-vendor.ps1`) |
 | `view` | Tutte le View* (Outline, Stats, Annotated, Html, Forms, Svg, Screenshot, Watch gating) | Quando si tocca un metodo View |
 | `edits` | Swap, Query, Raw, Dump, template, Merge | Quando si tocca un metodo di editing |
