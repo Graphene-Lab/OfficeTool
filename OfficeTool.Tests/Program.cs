@@ -32,8 +32,6 @@ static class Program
     {
         if (args.Contains("--agent")) return RunAgentScenario();
         if (args.Contains("--agent-dashboard")) return RunAgentDashboardScenario();
-        if (args.Contains("--agent-suite")) return RunAgentSuite();
-        if (args.Contains("--agent-view")) return RunAgentView();
 
         _range = ParseRange(Arg(args, "--range"));
         _filter = Arg(args, "--filter");
@@ -220,7 +218,7 @@ static class Program
         // Self-contained: creates its own files, so --group view works standalone.
         tool.Create("/view.docx");
         tool.Add("/body", "paragraph", new[] { "text=Hello World" });
-        Check("view docx reopen", tool.Open("/view.docx"));
+        Check("view docx reopen", tool.Open("/view.docx").StartsWith("Opened"));
         Check("view docx ViewOutline is JSON", tool.ViewOutline().StartsWith("{") && tool.ViewOutline().Contains("\"paragraphs\""));
         Check("view docx ViewStats is JSON", tool.ViewStats().StartsWith("{") && !tool.ViewStats().Contains("Error"));
         Check("view docx ViewAnnotated text", tool.ViewAnnotated().Contains("Hello World"));
@@ -243,9 +241,9 @@ static class Program
         Check("view pptx Query compact → total line + probe", compact.Contains("total:") && compact.Contains("compact probe"));
         var compactFields = tool.Query("shape", compact: true, fields: "x,y");
         Check("view pptx Query compact+fields → x= y= columns", compactFields.Contains("x=") && compactFields.Contains("y="));
-        var svg = tool.ViewSvg(1);
+        var svg = tool.ViewSvg("1");
         Check("view pptx ViewSvg → SVG markup", svg.StartsWith("<svg") || svg.Contains("<svg"));
-        Check("view pptx ViewSvg out-of-range → Error", tool.ViewSvg(99).StartsWith("Error:"));
+        Check("view pptx ViewSvg out-of-range → Error", tool.ViewSvg("99").StartsWith("Error:"));
         var shot = tool.ViewScreenshot("/shot.png");
         Check("view ViewScreenshot → png path or browser-missing error", shot.Contains(".png") || shot.Contains("Error"));
         // G4: omitted path must land inside the workspace under /out/, agent path returned, no host path leak
@@ -282,8 +280,10 @@ static class Program
         tool.Add("/body", "paragraph", new[] { "text=precious content" });
         tool.Save();
         var recreate = tool.Create("/g2.docx");
-        Check("edits docx Create overwrite → backup info", recreate.Contains("backed up as 'g2."));
-        Check("edits docx Create overwrite → Restore recovers", tool.Restore().Contains("restored") && tool.ViewText().Contains("precious content"));
+        Check("edits docx Create overwrite → new version (git backup)", recreate.Contains("New version:"));
+        var g2Host = AIOrchestrator.SandboxPath.Resolve("/g2.docx");
+        var g2History = AIOrchestrator.GitSupport.History(g2Host);
+        Check("edits docx Create overwrite → Restore recovers", tool.Restore(g2History[1].VersionId).StartsWith("Restored") && tool.ViewText().Contains("precious content"));
         Check("edits docx Create template", tool.Create("/tpl.docx").StartsWith("Created"));
         Check("edits docx template placeholder", tool.Add("/body", "paragraph", new[] { "text=Hello {{name}}" }).StartsWith("Added /body/p"));
         tool.Save();
@@ -462,7 +462,7 @@ static class Program
         Check("dashboard 2 CF rules", cfQ?["results"] is JsonArray cfa && cfa.Count >= 2);
         Check("dashboard Get activeTab", tool.Get("/").Contains("activeTab"));
 
-        Check("dashboard reopen", tool.Open("/dashboard.xlsx"));
+        Check("dashboard reopen", tool.Open("/dashboard.xlsx").StartsWith("Opened"));
         Check("dashboard 4 sheets after reopen", tool.Query("sheet").Contains("Dashboard") && tool.Query("sheet").Contains("Rankings"));
     }
 
@@ -536,8 +536,8 @@ static class Program
         Check("office cover big title + brand", slide1.Contains("44pt") && slide1.Contains("Strategy Review") && slide1.Contains("1B365D"));
         var shapes = Parse(tool.Query("shape"));
         Check("office 14+ shapes", shapes?["results"] is JsonArray sa && sa.Count >= 14);
-        Check("office ViewSvg slide 1", tool.ViewSvg(1).Contains("<svg"));
-        Check("office reopen", tool.Open("/deck.pptx") && Parse(tool.ViewOutline())?["totalSlides"]?.GetValue<int>() == 3);
+        Check("office ViewSvg slide 1", tool.ViewSvg("1").Contains("<svg"));
+        Check("office reopen", tool.Open("/deck.pptx").StartsWith("Opened") && Parse(tool.ViewOutline())?["totalSlides"]?.GetValue<int>() == 3);
     }
 
     static void RunWord(OfficeTool tool)
@@ -610,7 +610,7 @@ static class Program
         var tblQ = Parse(tool.Query("table"));
         Check("word 1 table", tblQ?["results"] is JsonArray ta && ta.Count == 1);
         Check("word bullets text", tool.Query("paragraph").Contains("Enterprise renewals up 24%"));
-        Check("word reopen", tool.Open("/demo.docx") && tool.Query("paragraph").Contains("Highlights"));
+        Check("word reopen", tool.Open("/demo.docx").StartsWith("Opened") && tool.Query("paragraph").Contains("Highlights"));
     }
 
     static void RunHelp(OfficeTool tool)
@@ -675,7 +675,7 @@ static class Program
         Setup.SkipIndexingOnStartup = true;
         Setup.DocumentsPath = _workspace;
         Setup.ProviderConfig = ProviderConfigs.Get(providerName);
-        var orch = new AgentOrchestrator(providerName);
+        var orch = new AgentHarness(providerName);
         try
         {
             var task = Task.Run(() => orch.ExecuteAction(
@@ -698,7 +698,7 @@ static class Program
                 return 1;
             }
             using var tool = new OfficeTool();
-            var ok = tool.Open("/deck.pptx");
+            var ok = tool.Open("/deck.pptx").StartsWith("Opened");
             Console.WriteLine(ok ? "✓ reopened deck.pptx" : "✗ cannot reopen deck.pptx");
             var outline = Parse(tool.ViewOutline());
             var slides = outline?["totalSlides"]?.GetValue<int>() ?? 0;
@@ -736,7 +736,7 @@ static class Program
         // Context data — the exact 20 sales rows of the vendor showcase workbook.
         File.WriteAllText(Path.Combine(_workspace, "sales-data.csv"), SalesDataCsv);
 
-        var orch = new AgentOrchestrator(providerName);
+        var orch = new AgentHarness(providerName);
         try
         {
             var task = Task.Run(() => orch.ExecuteAction(
@@ -763,7 +763,7 @@ static class Program
             Console.WriteLine($"✓ dashboard.xlsx produced ({new FileInfo(file).Length} bytes)");
 
             using var tool = new OfficeTool();
-            var ok = tool.Open("/dashboard.xlsx");
+            var ok = tool.Open("/dashboard.xlsx").StartsWith("Opened");
             if (!ok) { Console.WriteLine("✗ cannot reopen dashboard.xlsx"); return 1; }
             var sheets = tool.Query("sheet");
             Console.WriteLine($"Sheets: {sheets.Contains("Dashboard")} — Dashboard present: {sheets.Contains("Dashboard")}");
