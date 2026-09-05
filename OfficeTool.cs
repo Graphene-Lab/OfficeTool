@@ -1058,8 +1058,8 @@ namespace AIOrchestrator.API
         //  Helpers (adapter core)
         // ──────────────────────────────
 
-        private const string NoDocumentError = "Error: No document open. Call Open(path) or Create(path) first.";
-        private const string WatchGatedError = "Error: Watch requires a local desktop session. Use ViewHtml() instead.";
+        private static readonly string NoDocumentError = $"Error: No document open. Call {AIOrchestrator.Utility.ToSnakeCase(nameof(Open))}(path) or {AIOrchestrator.Utility.ToSnakeCase(nameof(Create))}(path) first.";
+        private static readonly string WatchGatedError = $"Error: Watch requires a local desktop session. Use {AIOrchestrator.Utility.ToSnakeCase(nameof(ViewHtml))}() instead.";
 
         /// <summary>Stops the watch server (if any) and releases its resources.</summary>
         private void StopWatch()

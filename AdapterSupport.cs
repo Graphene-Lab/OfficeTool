@@ -34,7 +34,7 @@ namespace AIOrchestrator.API
             var unsupported = handler.Set(path, props);
             var result = unsupported.Count == 0
                 ? $"Updated {path}."
-                : $"Updated {path}. Skipped unsupported properties: {string.Join(", ", unsupported)}. These apply to a different element — call Help(format, element) for the properties supported here.";
+                : $"Updated {path}. Skipped unsupported properties: {string.Join(", ", unsupported)}. These apply to a different element — call {AIOrchestrator.Utility.ToSnakeCase(nameof(OfficeTool.Help))}(format, element) for the properties supported here.";
             if (find != null)
             {
                 var matched = handler switch
@@ -114,7 +114,7 @@ namespace AIOrchestrator.API
                 return null;
             if (path.Contains("/sdt[", StringComparison.OrdinalIgnoreCase))
                 return null;
-            return $"Document is protected (mode: {protection}). Use Query(\"editable\") to find editable fields, or use force to override protection.";
+            return $"Document is protected (mode: {protection}). Use {AIOrchestrator.Utility.ToSnakeCase(nameof(OfficeTool.Query))}(\"editable\") to find editable fields, or use force to override protection.";
         }
 
         /// <summary>
