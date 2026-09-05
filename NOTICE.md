@@ -4,6 +4,10 @@
 
 Copyright © 2026 Andrea Bruno (Graphene-Lab).
 
+The OfficeTool adapter code (this repository, excluding the vendored engine below)
+is licensed under the **GNU Affero General Public License v3.0** — see
+[LICENSE.md](LICENSE.md).
+
 This package contains a vendored copy of the **OfficeCLI** engine
 (https://github.com/iOfficeAI/OfficeCLI), Copyright © 2026 OfficeCLI
 (https://OfficeCLI.AI), version **v1.0.144** (commit
