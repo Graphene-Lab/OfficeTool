@@ -9,7 +9,8 @@ using OfficeCli.Help;
 namespace AIOrchestrator.API
 {
     /// <summary>
-    /// Office document (DOCX/XLSX/PPTX) operations for agent use: create/open, view (outline/text/annotated/stats/issues),
+    /// Advanced structure-level editing of Office files (.docx/.xlsx/.pptx) by element path.
+    /// Use when the dedicated Word/Excel/slides tools can't express the change.
     /// get/query (path-based DOM), set/add/remove/move/swap, validate, batch, schema help, save.
     /// ONE document open at a time: Open()/Create() replaces the current one. Every save creates a new
     /// version in the workspace git repo (rollback via GitTool.restore).
