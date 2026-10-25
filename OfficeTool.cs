@@ -22,6 +22,7 @@ namespace AIOrchestrator.API
     /// Set/Add take properties as 'key=value' strings, e.g. Add("/body", "paragraph", props: ["text=Hello", "style=Heading1"]).
     /// Results are JSON (officecli --json envelope shape); failures return "Error: &lt;cause&gt;. &lt;fix&gt;. [valid values]".
     /// </summary>
+    [ToolPurpose(ToolPurpose.Documents | ToolPurpose.Spreadsheets | ToolPurpose.Presentations)]
     public class OfficeTool : BaseAgentTool, IDisposable, ILocalDesktopCapable, IFileTool
     {
         private IDocumentHandler? _handler;
