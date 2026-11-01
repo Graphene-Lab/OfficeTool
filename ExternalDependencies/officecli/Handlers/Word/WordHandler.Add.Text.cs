@@ -63,8 +63,13 @@ public partial class WordHandler
             // CONSISTENCY(style-warn): mirror SetParagraph (Set.cs:642) —
             // warn (advisory, non-fatal) when the style id is not defined
             // in the styles part; still store the ref (lenient-input).
-            if (!StyleIdExists(style))
-                LastAddWarnings.Add($"style '{style}' not found in styles part — will be referenced as-is");
+            // A built-in id (Heading1, Title, …) that the part does not define
+            // yet is materialized with Word's own definition — a dangling
+            // reference would be body text to Word (issue #407).
+            if (TryMaterializeBuiltInStyle(style))
+                LastAddWarnings.Add($"style '{style}' was not defined in the styles part; added Word's built-in definition ('{BuiltInStyleName(style)}')");
+            else if (!StyleIdExists(style))
+                LastAddWarnings.Add(StyleNotFoundWarning(style));
             pProps.ParagraphStyleId = new ParagraphStyleId { Val = style };
         }
         else if (properties.TryGetValue("styleName", out var styleName)
@@ -535,6 +540,10 @@ public partial class WordHandler
             // SpacingConverter.ParseWordSpacingSigned. Real docs (gov.cn TOC
             // overhangs) carry negative indents.
             ind.Left = SpacingConverter.ParseWordSpacingSigned(addLI).ToString();
+            // BUG-IND-ALIAS (#367): clear the ISO/strict spelling so a cloned or
+            // imported paragraph cannot keep a stale w:start next to the new
+            // w:left (two conflicting indents; a later normalizing save picks one).
+            WordIndentAliases.Normalize(ind);
         }
         if (properties.TryGetValue("rightindent", out var addRI) || properties.TryGetValue("rightIndent", out addRI) || properties.TryGetValue("indentright", out addRI))
         {
@@ -542,6 +551,7 @@ public partial class WordHandler
             // CONSISTENCY(lenient-spacing): see leftindent above.
             // BUG-DUMP-NEGIND: signed (see leftIndent above).
             ind.Right = SpacingConverter.ParseWordSpacingSigned(addRI).ToString();
+            WordIndentAliases.Normalize(ind); // BUG-IND-ALIAS (#367)
         }
         if (properties.TryGetValue("hangingindent", out var addHI) || properties.TryGetValue("hangingIndent", out addHI) || properties.TryGetValue("hanging", out addHI))
         {

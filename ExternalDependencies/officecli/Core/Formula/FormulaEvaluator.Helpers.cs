@@ -103,25 +103,25 @@ internal partial class FormulaEvaluator
 
         // Numeric comparison operators
         double numVal = cellValue?.AsNumber() ?? 0;
-        if (criteria.StartsWith(">=") && double.TryParse(criteria[2..], NumberStyles.Any, CultureInfo.InvariantCulture, out var ge)) return numVal >= ge;
-        if (criteria.StartsWith("<=") && double.TryParse(criteria[2..], NumberStyles.Any, CultureInfo.InvariantCulture, out var le)) return numVal <= le;
+        if (criteria.StartsWith(">=") && NumericText.TryParse(criteria[2..], out var ge)) return numVal >= ge;
+        if (criteria.StartsWith("<=") && NumericText.TryParse(criteria[2..], out var le)) return numVal <= le;
         if (criteria.StartsWith("<>"))
         {
             var operand = criteria[2..];
-            if (double.TryParse(operand, NumberStyles.Any, CultureInfo.InvariantCulture, out var ne)) return Math.Abs(numVal - ne) > 1e-10;
+            if (NumericText.TryParse(operand, out var ne)) return Math.Abs(numVal - ne) > 1e-10;
             // String not-equal
             return !string.Equals(cellValue?.AsString() ?? "", operand, StringComparison.OrdinalIgnoreCase);
         }
-        if (criteria.StartsWith(">") && double.TryParse(criteria[1..], NumberStyles.Any, CultureInfo.InvariantCulture, out var gt)) return numVal > gt;
-        if (criteria.StartsWith("<") && double.TryParse(criteria[1..], NumberStyles.Any, CultureInfo.InvariantCulture, out var lt)) return numVal < lt;
+        if (criteria.StartsWith(">") && NumericText.TryParse(criteria[1..], out var gt)) return numVal > gt;
+        if (criteria.StartsWith("<") && NumericText.TryParse(criteria[1..], out var lt)) return numVal < lt;
         if (criteria.StartsWith("="))
         {
             var operand = criteria[1..];
-            if (double.TryParse(operand, NumberStyles.Any, CultureInfo.InvariantCulture, out var eq)) return Math.Abs(numVal - eq) < 1e-10;
+            if (NumericText.TryParse(operand, out var eq)) return Math.Abs(numVal - eq) < 1e-10;
             // String equality after =
             return string.Equals(cellValue?.AsString() ?? "", operand, StringComparison.OrdinalIgnoreCase);
         }
-        if (double.TryParse(criteria, NumberStyles.Any, CultureInfo.InvariantCulture, out var plain)) return Math.Abs(numVal - plain) < 1e-10;
+        if (NumericText.TryParse(criteria, out var plain)) return Math.Abs(numVal - plain) < 1e-10;
 
         // Wildcard / string matching
         string cellStr = cellValue?.AsString() ?? "";
@@ -255,15 +255,18 @@ internal partial class FormulaEvaluator
     {
         s = s.Trim();
         if (s.Length == 0) return FR(0);
-        if (s.EndsWith("%") && double.TryParse(s[..^1].Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out var p))
+        if (s.EndsWith("%") && NumericText.TryParse(s[..^1].Trim(), out var p))
             return FR(p / 100.0);
         var body = s;
         foreach (var sym in new[] { "$", "¥", "€", "£", "₹" })
             if (body.StartsWith(sym)) { body = body[sym.Length..].Trim(); break; }
-        if (double.TryParse(body, NumberStyles.Any, CultureInfo.InvariantCulture, out var v)) return FR(v);
+        if (NumericText.TryParse(body, out var v)) return FR(v);
         if (Regex.IsMatch(s, @"^\d{1,2}:\d{2}(:\d{2})?$") && TimeSpan.TryParse(s, CultureInfo.InvariantCulture, out var ts))
             return FR(ts.TotalDays);
-        if (DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt)) return FR(dt.ToOADate());
+        // "1,5" is a decimal comma, not January 5 (see NumericText).
+        if (!NumericText.IsDecimalCommaSpelling(s)
+            && DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt))
+            return FR(dt.ToOADate());
         return FormulaResult.Error("#VALUE!");
     }
 

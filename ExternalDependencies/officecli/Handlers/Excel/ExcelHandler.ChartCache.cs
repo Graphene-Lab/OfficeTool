@@ -155,13 +155,16 @@ public partial class ExcelHandler
     private string ResolveCellRawText(Cell cell, Core.FormulaEvaluator evaluator)
     {
         if (cell.DataType?.Value == CellValues.InlineString)
-            return cell.InlineString?.InnerText ?? "";
+            return RstTextWithoutPhonetic(cell.InlineString);
         if (cell.DataType?.Value == CellValues.SharedString)
         {
             var value = cell.CellValue?.Text ?? "";
             var sst = _doc.WorkbookPart?.GetPartsOfType<SharedStringTablePart>().FirstOrDefault();
             if (sst?.SharedStringTable != null && int.TryParse(value, out int sidx))
-                return sst.SharedStringTable.Elements<SharedStringItem>().ElementAtOrDefault(sidx)?.InnerText ?? value;
+            {
+                var ssi = SharedStringAt(sst.SharedStringTable, sidx);
+                return ssi != null ? RstTextWithoutPhonetic(ssi) : value;
+            }
             return value;
         }
         if (cell.CellFormula?.Text is { } ft)

@@ -213,8 +213,7 @@ public partial class ExcelHandler
                 bool wantsRaw = keyGroup.Any(c =>
                     c.Op is AttributeFilter.FilterOp.GreaterThan or AttributeFilter.FilterOp.LessThan
                         or AttributeFilter.FilterOp.GreaterOrEqual or AttributeFilter.FilterOp.LessOrEqual
-                    || double.TryParse(c.Value, System.Globalization.NumberStyles.Any,
-                        System.Globalization.CultureInfo.InvariantCulture, out _));
+                    || NumericText.TryParse(c.Value, out _));
                 probe.Format[keyGroup.Key] = wantsRaw
                     ? GetCellRawComparisonValue(cell, eval)
                     : GetCellDisplayValue(cell, eval);

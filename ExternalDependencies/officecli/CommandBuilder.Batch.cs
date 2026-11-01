@@ -23,6 +23,9 @@ static partial class CommandBuilder
         + "\"path\" (set/remove/get target), \"selector\" (query filter; \"path\" is accepted as an alias), \"type\" (element type for add), "
         + "\"props\" (a key->value map of --prop values), \"to\"/\"after\"/\"before\" (move), "
         + "\"path2\" (swap's second path).\n\n"
+        + "A query item also takes its own output options as fields: \"compact\" (true = one line per element, "
+        + "the same format as `query --compact`) and \"fields\" (extra k=v columns, only with compact). "
+        + "A read item does not read \"props\" — putting an option there warns and the option is ignored.\n\n"
         + "Pass the array via --commands, or as the same JSON on stdin / --input <file>. Example:\n"
         + "[\n"
         + "  {\"command\":\"add\",\"parent\":\"/slide[1]\",\"type\":\"shape\",\"props\":{\"text\":\"Hi\",\"x\":\"1cm\",\"y\":\"2cm\"}},\n"
@@ -65,6 +68,15 @@ static partial class CommandBuilder
         ICollection<string>? unrecognizedLatex = null)
     {
         var results = new List<BatchResult>();
+        // Cross-document numbering replay (issue #404): give source list
+        // definitions whose ids the target already uses fresh ids, and
+        // rewrite this batch's references to them. All batch transports
+        // (CLI, resident, SDK executor) funnel through here.
+        if (handler is OfficeCli.Handlers.WordHandler numWord)
+        {
+            var (absIds, numIds) = numWord.GetNumberingDefinitionIds();
+            OfficeCli.Core.BatchCompat.RemapNumberingIds(items, absIds, numIds);
+        }
         for (int bi = 0; bi < items.Count; bi++)
         {
             var item = items[bi];
@@ -77,14 +89,47 @@ static partial class CommandBuilder
                     continue;
                 }
             }
+            // Batch dispatches straight to the shared handler methods, bypassing
+            // the standalone add/set wrappers that normally drain warnings into
+            // their output envelope. Capture a fresh warning scope per item so
+            // diagnostics retain the step that produced them.
+            OfficeCli.Core.WarningContext.Begin();
             try
             {
                 var output = ExecuteBatchItem(handler, item, json);
-                results.Add(new BatchResult { Index = bi, Success = true, Output = output });
+                var warnings = OfficeCli.Core.WarningContext.End();
+                if (handler is OfficeCli.Handlers.WordHandler word)
+                {
+                    // Word advisories live on the handler rather than in
+                    // WarningContext; standalone add/set merge these explicitly.
+                    var advisory = string.Equals(item.Command, "add", StringComparison.OrdinalIgnoreCase)
+                        ? word.LastAddWarnings
+                        : string.Equals(item.Command, "set", StringComparison.OrdinalIgnoreCase)
+                            ? word.LastSetWarnings
+                            : null;
+                    if (advisory is { Count: > 0 })
+                    {
+                        warnings ??= new List<OfficeCli.Core.CliWarning>();
+                        warnings.AddRange(advisory.Select(message => new OfficeCli.Core.CliWarning
+                        {
+                            Message = message,
+                            Code = "advisory",
+                        }));
+                    }
+                }
+                results.Add(new BatchResult { Index = bi, Success = true, Output = output, Warnings = warnings });
             }
             catch (Exception ex)
             {
-                results.Add(new BatchResult { Index = bi, Success = false, Item = item, Error = ex.Message, Code = OfficeCli.Core.OutputFormatter.InferErrorCode(ex) });
+                results.Add(new BatchResult
+                {
+                    Index = bi,
+                    Success = false,
+                    Item = item,
+                    Error = ex.Message,
+                    Code = OfficeCli.Core.OutputFormatter.InferErrorCode(ex),
+                    Warnings = OfficeCli.Core.WarningContext.End(),
+                });
                 if (stopOnError) break;
             }
             // BUG-BT2: per-item unrecognized-LaTeX diagnostics. The handler
@@ -119,6 +164,44 @@ static partial class CommandBuilder
     /// <c>FinalizeDeferredIds + Save</c> flush. Output formatting and the
     /// protection gate stay with the caller (their surfaces differ).
     /// </summary>
+    /// <summary>
+    /// Print a batch's results (text, or the read envelope with any
+    /// unrecognised-LaTeX warnings) and decide the exit code: 1 when any
+    /// item failed, else 2 when a warning was raised, else 0. Shared by the
+    /// CLI front-end and the resident so the two cannot drift.
+    /// </summary>
+    internal static int FinishBatch(List<BatchResult> results, int itemCount, bool json,
+        IReadOnlyCollection<string> unrecognizedLatex, bool rolledBack,
+        List<OfficeCli.Core.CliWarning>? extraWarnings = null)
+    {
+        var success = results.Count == 0 || !results.Any(r => !r.Success);
+        var warnings = unrecognizedLatex.Select(tok => new OfficeCli.Core.CliWarning
+        {
+            Message = $"unrecognized_latex_command: {tok}",
+            Code = "unrecognized_latex_command",
+            Suggestion = "Check the command spelling; see https://katex.org/docs/supported.html for supported syntax.",
+        }).ToList();
+        if (extraWarnings is { Count: > 0 }) warnings.AddRange(extraWarnings);
+        if (json)
+        {
+            using var sw = new System.IO.StringWriter();
+            PrintBatchResults(results, json, itemCount, sw, atomicRolledBack: rolledBack);
+            var inner = sw.ToString().TrimEnd('\n', '\r');
+            Console.WriteLine(OfficeCli.Core.OutputFormatter.WrapEnvelope(inner, warnings, success: success));
+        }
+        else
+        {
+            PrintBatchResults(results, json, itemCount, atomicRolledBack: rolledBack);
+            foreach (var w in warnings)
+                Console.Error.WriteLine($"  WARNING: {w.Message}");
+        }
+        // Exit precedence: a failed item (1) outranks "applied with caveats"
+        // (2), which only an unrecognised LaTeX command raises; informational
+        // warnings lifted from stderr do not change the exit code.
+        if (!success) return 1;
+        return unrecognizedLatex.Count > 0 ? 2 : 0;
+    }
+
     internal static List<BatchResult> RunNonResidentBatch(
         OfficeCli.Core.IDocumentHandler handler, List<BatchItem> items,
         bool stopOnError, bool json, ICollection<string>? unrecognizedLatex = null)
@@ -186,26 +269,28 @@ static partial class CommandBuilder
             // /dev/null redirect) with zero length carries no second payload
             // — skip the warning. Pipes (CanSeek=false) still warn: someone
             // is actively piping data that will be ignored.
-            bool stdinHasInput = Console.IsInputRedirected;
-            if (stdinHasInput)
+            // #340/#339: the warning below only needs to know whether a SECOND
+            // payload is sitting on stdin while --commands/--input is also given.
+            // The old refinement peeked a byte off stdin — but under `officecli
+            // mcp` stdin IS the JSON-RPC channel, and that consuming read (on an
+            // abandoned thread) swallowed the next request frame, so the client
+            // hung with no response. Determine it WITHOUT consuming: only a
+            // seekable stdin can be sized without reading. This makes the warning
+            // best-effort — most hosts expose redirected stdin as a non-seekable
+            // stream (Console.OpenStandardInput().CanSeek == false for pipes AND,
+            // on several platforms, for `< file` too), and those are deliberately
+            // left unconfirmed rather than consumed. Never swallowing a frame
+            // matters more than the warning. The actual stdin payload path below
+            // still reads stdin in full when batch has no explicit source.
+            bool stdinHasInput = false;
+            if (Console.IsInputRedirected)
             {
-                // Peek with a short timeout: /dev/null and closed stdin hit
-                // EOF instantly (no payload → no warning); a pipe carrying a
-                // real second payload has data ready (warn); an open-but-idle
-                // pipe times out and is treated as no payload — batch never
-                // reads stdin on this path anyway, so nothing is lost. The
-                // possibly-blocked Peek thread is abandoned; the process
-                // exits normally.
                 try
                 {
-                    var stdinPeek = System.Threading.Tasks.Task.Run(() =>
-                    {
-                        try { return StdIn.Peek() != -1; }
-                        catch { return false; }
-                    });
-                    stdinHasInput = stdinPeek.Wait(TimeSpan.FromMilliseconds(50)) && stdinPeek.Result;
+                    var probe = Console.OpenStandardInput(); // metadata only; never read/disposed
+                    stdinHasInput = probe.CanSeek && probe.Length > 0;
                 }
-                catch { /* keep IsInputRedirected verdict */ }
+                catch { /* treat as no confirmed payload */ }
             }
             if (inlineCommands != null && inputFile != null)
                 throw new ArgumentException(
@@ -237,7 +322,7 @@ static partial class CommandBuilder
                 // skipped on purpose — '-' is not a path.)
                 if (inputFile.Name == "-")
                 {
-                    jsonText = StripBom(StdIn.ReadToEnd());
+                    jsonText = ReadStdInPayload("batch", BatchPayloadFlags);
                 }
                 else
                 {
@@ -256,7 +341,7 @@ static partial class CommandBuilder
                 // System.Text.Json.Parse with "'﻿' is an invalid start of
                 // a value" while `batch --input utf8bom.json` succeeded —
                 // splitting the contract on the input source.
-                jsonText = StripBom(StdIn.ReadToEnd());
+                jsonText = ReadStdInPayload("batch", BatchPayloadFlags);
             }
 
             // Pre-validate: check for unknown JSON fields before deserializing
@@ -412,10 +497,12 @@ static partial class CommandBuilder
                     return 3;
                 }
                 // The resident returns the formatted batch output directly
+                // Same printing as TryResident: the server trims trailing
+                // newlines, the client restores exactly one.
                 if (!string.IsNullOrEmpty(response.Stdout))
-                    Console.Write(response.Stdout);
+                    Console.WriteLine(response.Stdout.TrimEnd('\r', '\n'));
                 if (!string.IsNullOrEmpty(response.Stderr))
-                    Console.Error.Write(response.Stderr);
+                    Console.Error.WriteLine(response.Stderr.TrimEnd('\r', '\n'));
                 return response.ExitCode;
             }
 
@@ -531,6 +618,7 @@ static partial class CommandBuilder
             }
             List<BatchResult> batchResults;
             var batchUnrecognizedLatex = new List<string>();
+            List<OfficeCli.Core.CliWarning>? batchStderrWarnings = null;
             bool batchSuccessLocal;
             try
             {
@@ -541,20 +629,25 @@ static partial class CommandBuilder
                 {
                     var protBlock = GetBatchProtectionBlock(handler, items);
                     if (protBlock != null)
-                    {
-                        if (json)
-                            Console.WriteLine(OfficeCli.Core.OutputFormatter.WrapEnvelopeError(protBlock, new List<OfficeCli.Core.CliWarning>()));
-                        else
-                            Console.Error.WriteLine($"ERROR: {protBlock}");
-                        if (tmpPath != null)
-                            try { System.IO.File.Delete(tmpPath); } catch { /* best-effort */ }
-                        return 1;
-                    }
+                        throw new CliException(protBlock) { Code = "document_protected" };
                 }
                 // DeferSave + replay loop, shared with the MCP batch surface. The
                 // handler's using-Dispose performs the single FinalizeDeferredIds +
                 // Save flush.
-                batchResults = RunNonResidentBatch(handler, items, stopOnError, json, batchUnrecognizedLatex);
+                // --json: handler/selector warnings written to stderr while the
+                // items run become envelope warnings, as they do through the
+                // resident (same classifier).
+                if (json)
+                {
+                    var origErr = Console.Error;
+                    var errCapture = new System.IO.StringWriter();
+                    Console.SetError(errCapture);
+                    try { batchResults = RunNonResidentBatch(handler, items, stopOnError, json, batchUnrecognizedLatex); }
+                    finally { Console.SetError(origErr); }
+                    batchStderrWarnings = ResidentServer.BuildWarnings(errCapture.ToString().TrimEnd('\r', '\n'));
+                }
+                else
+                    batchResults = RunNonResidentBatch(handler, items, stopOnError, json, batchUnrecognizedLatex);
                 batchSuccessLocal = batchResults.Count == 0 || !batchResults.Any(r => !r.Success);
                 // Watch preview: only when the document actually changes — the
                 // atomic rollback leaves the file exactly as the preview
@@ -584,7 +677,7 @@ static partial class CommandBuilder
                     // temp copy must not leak on that path.
                     try
                     {
-                        System.IO.File.Replace(tmpPath, targetPath, destinationBackupFileName: null);
+                        OfficeCli.Core.AtomicPackageWriter.ReplaceFile(tmpPath, targetPath);
                     }
                     catch
                     {
@@ -597,55 +690,8 @@ static partial class CommandBuilder
                     try { System.IO.File.Delete(tmpPath); } catch { /* best-effort */ }
                 }
             }
-            // BUG-R6-02: in --json mode the non-resident path emitted the raw
-            // {"results":...,"summary":...} body while the resident path
-            // wrapped it in {"success":..., "data":{...}} (resident server
-            // calls OutputFormatter.WrapEnvelope on any JSON-shaped stdout).
-            // Capture PrintBatchResults output and apply the same envelope
-            // here so callers see the same shape regardless of resident state.
-            // JSON Envelope contract: batch is a *judgment* command (root
-            // the project conventions "Judgment: any batch step failed -> outer false").
-            // Outer envelope.success is true only when every step succeeded;
-            // a single failed step flips outer to false even if siblings
-            // succeeded. Per-step verdicts still ride on
-            // `data.results[].success`. Exit code stays in lockstep with
-            // envelope.success so CI gates and shells can rely on the single
-            // signal. Two `success` fields appear in the JSON (outer batch
-            // verdict, inner per-step) — disambiguate by JSON path.
-            var batchSuccess = batchResults.Count == 0 || !batchResults.Any(r => !r.Success);
-            // BUG-BT2: surface per-item unrecognized-LaTeX warnings the same way
-            // single-shot add/set do (warning + JSON envelope + exit 2). A batch
-            // whose only issue is an unknown LaTeX command otherwise exited 0
-            // with no diagnostic, silently writing the literal-text fallback.
-            var batchWarnings = new List<OfficeCli.Core.CliWarning>();
-            foreach (var tok in batchUnrecognizedLatex)
-            {
-                batchWarnings.Add(new OfficeCli.Core.CliWarning
-                {
-                    Message = $"unrecognized_latex_command: {tok}",
-                    Code = "unrecognized_latex_command",
-                    Suggestion = "Check the command spelling; see https://katex.org/docs/supported.html for supported syntax.",
-                });
-            }
-            var rolledBack = atomic && !batchSuccess;
-            if (json)
-            {
-                using var sw = new System.IO.StringWriter();
-                PrintBatchResults(batchResults, json, items.Count, sw, atomicRolledBack: rolledBack);
-                var inner = sw.ToString().TrimEnd('\n', '\r');
-                Console.WriteLine(OfficeCli.Core.OutputFormatter.WrapEnvelope(inner, batchWarnings, success: batchSuccess));
-            }
-            else
-            {
-                PrintBatchResults(batchResults, json, items.Count, atomicRolledBack: rolledBack);
-                foreach (var w in batchWarnings)
-                    Console.Error.WriteLine($"  WARNING: {w.Message}");
-            }
-            // (watch notify happened inside the handler scope above)
-            // Exit precedence: a failed item (exit 1) outranks an
-            // unrecognized-LaTeX-only warning (exit 2 mirrors single-shot).
-            if (!batchSuccess) return 1;
-            return batchWarnings.Count > 0 ? 2 : 0;
+            var rolledBack = atomic && batchResults.Any(r => !r.Success);
+            return FinishBatch(batchResults, items.Count, json, batchUnrecognizedLatex, rolledBack, batchStderrWarnings);
         }, json); });
 
         return batchCommand;
@@ -693,6 +739,25 @@ static partial class CommandBuilder
             : Console.In);
 
     internal static TextReader StdIn => LazyStdIn.Value;
+
+    /// <summary>
+    /// Read a whole piped payload (batch JSON, import CSV/TSV) from stdin.
+    ///
+    /// Under `officecli mcp` stdin is the JSON-RPC channel, which the client
+    /// keeps open for the whole session: ReadToEnd would wait for an EOF that
+    /// never comes, and because commands run on the server's request loop,
+    /// every later request would go unanswered. Refuse instead, naming the
+    /// flag that carries the payload (<paramref name="useInstead"/>).
+    /// </summary>
+    private const string BatchPayloadFlags = "Pass the JSON array via --commands '<json>' or --input <file>.";
+
+    internal static string ReadStdInPayload(string verb, string useInstead)
+    {
+        if (McpServer.InMcpMode)
+            throw new ArgumentException(
+                $"{verb}: cannot read from stdin under MCP (stdin is the JSON-RPC channel). {useInstead}");
+        return StripBom(StdIn.ReadToEnd());
+    }
 
     /// <summary>
     /// The atomic temp name adds ~45 bytes of affixes around the document's

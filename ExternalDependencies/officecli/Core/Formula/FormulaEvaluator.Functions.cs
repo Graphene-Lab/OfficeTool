@@ -912,7 +912,7 @@ internal partial class FormulaEvaluator
         s = s.Replace(dec[0].ToString(), ".");       // decimal separator -> '.'
         int pct = 0;
         while (s.EndsWith("%")) { pct++; s = s[..^1]; }   // trailing % scales by 1/100
-        return double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var v)
+        return NumericText.TryParse(s, out var v)
             ? FR(v / Math.Pow(100, pct))
             : FormulaResult.Error("#VALUE!");
     }

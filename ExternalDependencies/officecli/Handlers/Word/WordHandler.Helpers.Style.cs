@@ -31,6 +31,108 @@ public partial class WordHandler
     }
 
     /// <summary>
+    /// Issue #366: `style=`/`styleId=` target the OOXML styleId. Passing a DISPLAY
+    /// NAME ("heading 2" where the styleId is "Heading2" — exactly what a Word or
+    /// Google Docs export looks like) stores a dangling pStyle that Word renders as
+    /// body text and drops on save. The generic "not found" advisory left the caller
+    /// with nowhere to go, so when the value IS an existing style's display name,
+    /// name the channel that resolves it and the id it resolves to.
+    /// </summary>
+    private string StyleNotFoundWarning(string value)
+    {
+        var resolved = ResolveStyleIdFromName(value);
+        return resolved != null
+            ? $"style '{value}' is a display name, not a styleId — will be referenced as-is. "
+                + $"Use styleName='{value}' to resolve it (styleId '{resolved}')."
+            : $"style '{value}' not found in styles part — will be referenced as-is";
+    }
+
+    /// <summary>
+    /// Word's built-in paragraph styles that a fresh document does not define
+    /// (its styles.xml carries only Normal). Word keys a built-in by its
+    /// DISPLAY NAME: a <w:pStyle w:val="Heading1"/> with no such style in the
+    /// part is body text to Word — no outline level, no Navigation pane entry,
+    /// nothing for a screen reader to jump to — while `view outline` happily
+    /// reported a heading. Referencing one of these ids now materializes the
+    /// definition Word itself would write (name, outline level, the default
+    /// look), so the file means what the caller asked for.
+    /// Values follow Word's Normal template: colour accent1 (2F5496) / its
+    /// darker shade (1F3763) / near-black (272727); sizes in half-points.
+    /// </summary>
+    private static readonly Dictionary<string, (string Name, int? OutlineLvl, int Sz, string? Color, bool Italic, int Before)>
+        BuiltInParagraphStyles = new(StringComparer.Ordinal)
+    {
+        ["Heading1"] = ("heading 1", 0, 32, "2F5496", false, 240),
+        ["Heading2"] = ("heading 2", 1, 26, "2F5496", false, 40),
+        ["Heading3"] = ("heading 3", 2, 24, "1F3763", false, 40),
+        ["Heading4"] = ("heading 4", 3, 22, "2F5496", true, 40),
+        ["Heading5"] = ("heading 5", 4, 22, "2F5496", false, 40),
+        ["Heading6"] = ("heading 6", 5, 22, "1F3763", false, 40),
+        ["Heading7"] = ("heading 7", 6, 22, "1F3763", true, 40),
+        ["Heading8"] = ("heading 8", 7, 21, "272727", false, 40),
+        ["Heading9"] = ("heading 9", 8, 21, "272727", true, 40),
+        ["Title"] = ("Title", null, 56, null, false, 0),
+        ["Subtitle"] = ("Subtitle", null, 22, "5A5A5A", false, 0),
+    };
+
+    /// <summary>Word's display name for a built-in styleId, or null.</summary>
+    internal static string? BuiltInStyleName(string? styleId)
+        => styleId != null && BuiltInParagraphStyles.TryGetValue(styleId, out var d) ? d.Name : null;
+
+    /// <summary>
+    /// Define <paramref name="styleId"/> in the styles part when it is one of
+    /// Word's built-ins and the part does not carry it yet. Returns true when a
+    /// definition was added.
+    /// </summary>
+    internal bool TryMaterializeBuiltInStyle(string? styleId)
+    {
+        if (styleId == null || StyleIdExists(styleId)
+            || !BuiltInParagraphStyles.TryGetValue(styleId, out var d))
+            return false;
+        var mainPart = _doc.MainDocumentPart;
+        if (mainPart == null) return false;
+        var stylesPart = mainPart.StyleDefinitionsPart ?? mainPart.AddNewPart<StyleDefinitionsPart>();
+        stylesPart.Styles ??= new Styles();
+
+        var style = new Style { Type = StyleValues.Paragraph, StyleId = styleId };
+        style.AppendChild(new StyleName { Val = d.Name });
+        style.AppendChild(new BasedOn { Val = "Normal" });
+        style.AppendChild(new NextParagraphStyle { Val = "Normal" });
+        style.AppendChild(new UIPriority { Val = d.OutlineLvl.HasValue ? 9 : 10 });
+        if (d.OutlineLvl is > 0) style.AppendChild(new SemiHidden());
+        if (d.OutlineLvl is > 0) style.AppendChild(new UnhideWhenUsed());
+        style.AppendChild(new PrimaryStyle());
+
+        var pPr = new StyleParagraphProperties();
+        if (d.OutlineLvl.HasValue)
+        {
+            pPr.AppendChild(new KeepNext());
+            pPr.AppendChild(new KeepLines());
+            pPr.AppendChild(new SpacingBetweenLines { Before = d.Before.ToString(), After = "0" });
+            pPr.AppendChild(new OutlineLevel { Val = d.OutlineLvl.Value });
+        }
+        else
+        {
+            pPr.AppendChild(new SpacingBetweenLines { After = "0", Line = "240", LineRule = LineSpacingRuleValues.Auto });
+            pPr.AppendChild(new ContextualSpacing());
+        }
+        style.AppendChild(pPr);
+
+        var rPr = new StyleRunProperties();
+        if (d.OutlineLvl is null or < 3 || styleId == "Title")
+            rPr.AppendChild(new RunFonts { AsciiTheme = ThemeFontValues.MajorHighAnsi, HighAnsiTheme = ThemeFontValues.MajorHighAnsi, EastAsiaTheme = ThemeFontValues.MajorEastAsia, ComplexScriptTheme = ThemeFontValues.MajorBidi });
+        if (d.Italic) { rPr.AppendChild(new Italic()); rPr.AppendChild(new ItalicComplexScript()); }
+        if (d.Color != null) rPr.AppendChild(new Color { Val = d.Color });
+        if (styleId == "Title") { rPr.AppendChild(new Spacing { Val = -10 }); rPr.AppendChild(new Kern { Val = 28U }); }
+        rPr.AppendChild(new FontSize { Val = d.Sz.ToString() });
+        rPr.AppendChild(new FontSizeComplexScript { Val = d.Sz.ToString() });
+        style.AppendChild(rPr);
+
+        stylesPart.Styles.AppendChild(style);
+        return true;
+    }
+
+    /// <summary>
     /// Returns true if a style with the given styleId exists in the Styles part.
     /// "Normal" is implicit in OOXML and considered to exist even when the
     /// blank-document StyleDefinitionsPart is empty/absent — matches Word's

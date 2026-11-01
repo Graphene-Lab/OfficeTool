@@ -57,10 +57,12 @@ internal static class HtmlScreenshot
                 CreateNoWindow = true,
             };
             foreach (var a in args) psi.ArgumentList.Add(a);
+            OrphanReaper.Arm();
             using var p = Process.Start(psi);
             if (p == null) return null;
             var stdout = p.StandardOutput.ReadToEnd();
-            if (!p.WaitForExit(timeoutMs)) { try { p.Kill(true); } catch { } return null; }
+            if (!p.WaitForExit(timeoutMs)) { try { p.Kill(true); } catch { } OrphanReaper.Reap(); return null; }
+            OrphanReaper.Reap();
             return stdout;
         }
         catch { return null; }
@@ -570,6 +572,7 @@ internal static class HtmlScreenshot
                 $"--screenshot={outPath}",
                 url,
             }) psi.ArgumentList.Add(a);
+            OrphanReaper.Arm();
             using var p = Process.Start(psi);
             if (p == null) return (false, null);
             var outTask = p.StandardOutput.ReadToEndAsync();
@@ -577,11 +580,64 @@ internal static class HtmlScreenshot
             if (!p.WaitForExit(120_000))
             {
                 try { p.Kill(true); } catch { /* ignore */ }
+                OrphanReaper.Reap();
                 return (false, null);
             }
+            OrphanReaper.Reap();
             return (p.ExitCode == 0, errTask.GetAwaiter().GetResult());
         }
         catch { return (false, null); }
+    }
+
+    /// <summary>
+    /// Linux only: Chromium's zygote and crashpad helpers outlive the browser
+    /// process by a few milliseconds, so they are reparented to PID 1 when the
+    /// browser exits. In a container whose PID 1 does not reap (sleep, a shell,
+    /// an app server) every capture leaves them as zombies (issue #482). Becoming
+    /// a child subreaper makes them land on us instead, and <see cref="Reap"/>
+    /// collects them once the browser has exited. No-op elsewhere.
+    /// </summary>
+    private static class OrphanReaper
+    {
+        [DllImport("libc", SetLastError = true)]
+        private static extern int prctl(int option, ulong arg2, ulong arg3, ulong arg4, ulong arg5);
+
+        [DllImport("libc", SetLastError = true)]
+        private static extern int waitpid(int pid, out int status, int options);
+
+        private const int PR_SET_CHILD_SUBREAPER = 36;
+        private const int WNOHANG = 1;
+        private static bool _armed;
+
+        public static void Arm()
+        {
+            if (_armed || !OperatingSystem.IsLinux()) return;
+            try { _armed = prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0; }
+            catch { /* older libc or unusual sandbox: fall back to the old behaviour */ }
+        }
+
+        /// <summary>
+        /// Collect helpers reparented to us. The browser itself was already waited
+        /// for by Process, so only the orphans are left; they die within
+        /// milliseconds, bounded here to one second.
+        /// </summary>
+        public static void Reap()
+        {
+            if (!_armed) return;
+            var deadline = Environment.TickCount64 + 1000;
+            try
+            {
+                while (true)
+                {
+                    var r = waitpid(-1, out _, WNOHANG);
+                    if (r > 0) continue;              // reaped one; look for more
+                    if (r < 0) return;                // ECHILD: nothing left
+                    if (Environment.TickCount64 > deadline) return;
+                    Thread.Sleep(5);                  // a live child still winding down
+                }
+            }
+            catch { /* best effort */ }
+        }
     }
 
     private static (bool, string?) RunBinary(string bin, string[] args)
@@ -600,13 +656,16 @@ internal static class HtmlScreenshot
                 CreateNoWindow = true,
             };
             foreach (var a in args) psi.ArgumentList.Add(a);
+            OrphanReaper.Arm();
             using var p = Process.Start(psi);
             if (p == null) return (false, "process did not start");
             if (!p.WaitForExit(120_000))
             {
                 try { p.Kill(true); } catch { /* ignore */ }
+                OrphanReaper.Reap();
                 return (false, "timeout after 120s");
             }
+            OrphanReaper.Reap();
             if (p.ExitCode != 0)
             {
                 var stderr = p.StandardError.ReadToEnd();

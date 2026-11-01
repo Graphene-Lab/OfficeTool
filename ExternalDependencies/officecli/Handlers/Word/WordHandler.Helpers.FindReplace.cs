@@ -555,20 +555,11 @@ public partial class WordHandler
                     if (isRegex && matchObjs != null && i < matchObjs.Count)
                         effectiveReplace = matchObjs[i].Result(replace);
 
-                    // Cross-hyperlink replacement is still rejected — the wrapped
-                    // form would corrupt the URL/format-binding of the hyperlink
-                    // structure just as the unwrapped form did.
-                    {
-                        var affected = BuildRunTexts(para)
-                            .Where(rt => rt.End > matchStart && rt.Start < matchEnd)
-                            .Select(rt => rt.Run.Ancestors<Hyperlink>().FirstOrDefault())
-                            .Distinct()
-                            .ToList();
-                        if (affected.Count > 1)
-                            throw new ArgumentException(
-                                $"find/replace+revision cannot span a hyperlink boundary "
-                                + $"(match at offset {matchStart}, length {matchLen})");
-                    }
+                    // A match may cross a w:hyperlink boundary: every matched run
+                    // is wrapped as w:del where it lives (inside the hyperlink or
+                    // in the paragraph), so the hyperlink keeps its r:id and
+                    // formatting binding. Only the untracked path has to refuse
+                    // this, because it rewrites text across runs.
 
                     // Split the runs so the matched span is a contiguous list of
                     // sibling runs we can wrap individually.
@@ -611,22 +602,30 @@ public partial class WordHandler
                     // Wrap each matched run as w:del. WrapRunAsDeleted returns the
                     // wrapper so we can locate the insertion point for the w:ins
                     // (immediately after the last w:del wrapper).
+                    DeletedRun? firstDelWrapper = null;
                     DeletedRun? lastDelWrapper = null;
                     foreach (var run in targetRuns)
                     {
                         var w = WrapRunAsDeleted(run, author, date, null);
-                        if (w != null) lastDelWrapper = w;
+                        if (w != null) { firstDelWrapper ??= w; lastDelWrapper = w; }
                     }
 
                     // Insert replacement (skip if user passed --prop replace="" — a
                     // deletion-only operation). The new w:ins sibling sits right
-                    // after the last w:del wrapper.
+                    // after the last w:del wrapper. When the match crossed a
+                    // hyperlink boundary the wrappers have different parents; the
+                    // replacement then goes where the match started (before the
+                    // first wrapper, in its container), which is where Word puts
+                    // text typed over such a selection.
                     if (!string.IsNullOrEmpty(effectiveReplace) && lastDelWrapper?.Parent != null)
                     {
                         var newRun = new Run(
                             templateRPr,
                             new Text(effectiveReplace) { Space = SpaceProcessingModeValues.Preserve });
-                        lastDelWrapper.Parent.InsertAfter(newRun, lastDelWrapper);
+                        if (firstDelWrapper?.Parent != null && !ReferenceEquals(firstDelWrapper.Parent, lastDelWrapper.Parent))
+                            firstDelWrapper.Parent.InsertBefore(newRun, firstDelWrapper);
+                        else
+                            lastDelWrapper.Parent.InsertAfter(newRun, lastDelWrapper);
                         WrapRunAsInserted(newRun, author, date, null);
                     }
                 }
@@ -1166,67 +1165,134 @@ public partial class WordHandler
         InsertPosition? position,
         Dictionary<string, string> properties)
     {
-        // Split runs at the point
+        // Split runs at the point. BuildRunTexts walks Descendants<Run>(), so
+        // the match may land on a run NESTED in an inline container
+        // (w:ins / w:del / w:hyperlink / w:sdt …), while the new element is
+        // always inserted as a DIRECT paragraph child. Issue #402: the index
+        // used to be computed against para.Elements<Run>() only — a nested
+        // anchor run was never found there and the insert fell through to
+        // "append at end". Resolve the anchor to its paragraph-level ancestor
+        // instead, splitting tracked-change / hyperlink containers when the
+        // anchor falls inside them so the slot is exact.
         var runTexts = BuildRunTexts(para);
-        Run? insertAfterRun = null;
+        OpenXmlElement? insertBefore = null; // paragraph-level child to insert in front of
+        bool resolved = false;
 
         foreach (var rt in runTexts)
         {
             if (splitPoint >= rt.Start && splitPoint <= rt.End)
             {
+                resolved = true;
                 if (splitPoint == rt.Start)
                 {
-                    // Insert before this run — find previous run
-                    insertAfterRun = rt.Run.PreviousSibling<Run>();
-                }
-                else if (splitPoint == rt.End)
-                {
-                    // Insert after this run
-                    insertAfterRun = rt.Run;
+                    insertBefore = SplitOutBefore(para, rt.Run);
                 }
                 else
                 {
-                    // Split the run at the offset
-                    var localOffset = splitPoint - rt.Start;
-                    SplitRunAtOffset(rt.Run, rt.TextElement, localOffset);
-                    insertAfterRun = rt.Run; // insert after the left portion
+                    if (splitPoint < rt.End)
+                        SplitRunAtOffset(rt.Run, rt.TextElement, splitPoint - rt.Start);
+                    // Insert right after rt.Run (or its left half), outside
+                    // every container that holds it.
+                    insertBefore = SplitOutAfter(para, rt.Run).NextSibling();
                 }
                 break;
             }
         }
 
-        // Calculate run-based index for insertion
-        var runs = para.Elements<Run>().ToList();
-        int runIndex;
-        if (insertAfterRun != null)
-        {
-            var idx = runs.IndexOf(insertAfterRun);
-            runIndex = idx >= 0 ? idx + 1 : runs.Count;
-        }
-        else
-        {
-            runIndex = 0; // insert before all runs
-        }
-
-        // Convert run-count index → ChildElements-index so downstream handlers
-        // (which read parent.ChildElements[index]) land at the right slot. When
-        // the paragraph has a ParagraphProperties child, the ChildElements
-        // index is shifted by one; when inserting before all runs, point at
-        // the first run's ChildElements index rather than 0 (which is pPr).
         var childElems = para.ChildElements.ToList();
         int childIndex;
-        if (runIndex >= runs.Count)
+        if (!resolved)
+        {
+            // Defensive: before the first non-pPr child (never reached for a
+            // paragraph with text, since the ranges are contiguous).
+            var first = childElems.FirstOrDefault(c => c is not ParagraphProperties);
+            childIndex = first != null ? childElems.IndexOf(first) : childElems.Count;
+        }
+        else if (insertBefore == null)
         {
             childIndex = childElems.Count;
         }
         else
         {
-            var targetRun = runs[runIndex];
-            childIndex = childElems.IndexOf(targetRun);
+            childIndex = childElems.IndexOf(insertBefore);
             if (childIndex < 0) childIndex = childElems.Count;
         }
 
         return Add(parentPath, type, InsertPosition.AtIndex(childIndex), properties);
+    }
+
+    /// <summary>
+    /// Inline containers that may be split in two around an insertion point
+    /// without changing meaning: two adjacent w:ins/w:del with fresh ids, or
+    /// two hyperlinks to the same target. Anything else (sdt, smartTag,
+    /// customXml, fields …) is left whole and the insert lands next to it.
+    /// </summary>
+    private static bool IsSplittableInlineContainer(OpenXmlElement e) =>
+        e is InsertedRun || e is DeletedRun || e is Hyperlink;
+
+    private OpenXmlElement CloneInlineContainerShell(OpenXmlElement container)
+    {
+        var clone = container.CloneNode(false);
+        switch (clone)
+        {
+            case InsertedRun ins: ins.Id = GenerateRevisionId(); break;
+            case DeletedRun del: del.Id = GenerateRevisionId(); break;
+        }
+        return clone;
+    }
+
+    /// <summary>
+    /// Climb from <paramref name="run"/> to the child of <paramref name="para"/>
+    /// that should be inserted BEFORE so that <paramref name="run"/> and
+    /// everything after it stays on the right of the new element. Splittable
+    /// containers holding earlier content are split; the right part is returned.
+    /// </summary>
+    private OpenXmlElement SplitOutBefore(Paragraph para, OpenXmlElement run)
+    {
+        var cur = run;
+        while (cur.Parent != null && !ReferenceEquals(cur.Parent, para))
+        {
+            var container = cur.Parent;
+            if (IsSplittableInlineContainer(container) && cur.PreviousSibling() != null)
+            {
+                var right = CloneInlineContainerShell(container);
+                var move = new List<OpenXmlElement>();
+                for (var e = cur; e != null; e = e.NextSibling()) move.Add(e);
+                foreach (var e in move) { e.Remove(); right.AppendChild(e); }
+                container.InsertAfterSelf(right);
+                cur = right;
+            }
+            else
+            {
+                cur = container;
+            }
+        }
+        return cur;
+    }
+
+    /// <summary>
+    /// Climb from <paramref name="run"/> to the child of <paramref name="para"/>
+    /// that should be inserted AFTER so that <paramref name="run"/> and
+    /// everything before it stays on the left of the new element. Splittable
+    /// containers holding later content are split; the left part is returned.
+    /// </summary>
+    private OpenXmlElement SplitOutAfter(Paragraph para, OpenXmlElement run)
+    {
+        var cur = run;
+        while (cur.Parent != null && !ReferenceEquals(cur.Parent, para))
+        {
+            var container = cur.Parent;
+            if (IsSplittableInlineContainer(container) && cur.NextSibling() != null)
+            {
+                var right = CloneInlineContainerShell(container);
+                var move = new List<OpenXmlElement>();
+                for (var e = cur.NextSibling(); e != null; e = e.NextSibling()) move.Add(e);
+                foreach (var e in move) { e.Remove(); right.AppendChild(e); }
+                container.InsertAfterSelf(right);
+            }
+            cur = container;
+        }
+        return cur;
     }
 
     /// <summary>

@@ -2802,7 +2802,11 @@ public partial class PowerPointHandler
             var hex = ParseHelpers.TryGetNamedColorHex(prstColor.Val!.InnerText);
             if (hex != null)
             {
-                var transformed = ApplyColorTransforms(hex, prstColor);
+                // Alpha is folded in by the caller below (same as the srgbClr
+                // branch). ApplyColorTransforms folds it too and returns an
+                // rgba() string, which the hex parse below then rejected —
+                // one translucent preset color aborted the whole HTML render.
+                var transformed = ApplyOpaqueColorTransforms(hex, prstColor);
                 var solid = transformed.StartsWith('#') ? transformed[1..] : transformed;
                 var alpha = prstColor.GetFirstChild<Drawing.Alpha>()?.Val?.Value;
                 if (alpha.HasValue && alpha.Value < 100000)
@@ -2821,7 +2825,7 @@ public partial class PowerPointHandler
             var sysHex = SysColorHex(sysColor);
             if (sysHex != null)
             {
-                var transformed = ApplyColorTransforms(sysHex, sysColor);
+                var transformed = ApplyOpaqueColorTransforms(sysHex, sysColor);
                 var solid = transformed.StartsWith('#') ? transformed[1..] : transformed;
                 var alpha = sysColor.GetFirstChild<Drawing.Alpha>()?.Val?.Value;
                 if (alpha.HasValue && alpha.Value < 100000)
@@ -2898,6 +2902,20 @@ public partial class PowerPointHandler
 
     private static string ApplyColorTransforms(string hex, Drawing.SchemeColor schemeColor)
         => ApplyColorTransforms(hex, (OpenXmlElement)schemeColor);
+
+    /// <summary>
+    /// <see cref="ApplyColorTransforms(string, OpenXmlElement)"/> minus alpha:
+    /// for callers that fold alpha in themselves and need a #RRGGBB back.
+    /// </summary>
+    private static string ApplyOpaqueColorTransforms(string hex, OpenXmlElement colorEl)
+    {
+        return ColorMath.ApplyTransforms(hex,
+            tint: ReadTransformVal(colorEl, "tint"),
+            shade: ReadTransformVal(colorEl, "shade"),
+            lumMod: ReadTransformVal(colorEl, "lumMod"),
+            lumOff: ReadTransformVal(colorEl, "lumOff"),
+            satMod: ReadTransformVal(colorEl, "satMod"));
+    }
 
     /// <summary>
     /// Apply lumMod/lumOff/tint/shade/alpha child transforms on any color element

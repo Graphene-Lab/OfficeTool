@@ -47,12 +47,21 @@ public static class McpInstaller
     {
         var pathEnv = Environment.GetEnvironmentVariable("PATH");
         if (string.IsNullOrEmpty(pathEnv)) return null;
+        // Windows launchers are usually `.cmd` / `.exe` wrappers; honour
+        // PATHEXT so the lookup matches what the shell would run.
+        var exts = new List<string> { "" };
+        if (OperatingSystem.IsWindows() && !Path.HasExtension(exe))
+            exts.AddRange((Environment.GetEnvironmentVariable("PATHEXT") ?? ".EXE;.CMD;.BAT")
+                .Split(';', StringSplitOptions.RemoveEmptyEntries));
         foreach (var dir in pathEnv.Split(Path.PathSeparator))
         {
             if (string.IsNullOrEmpty(dir)) continue;
-            string candidate;
-            try { candidate = Path.Combine(dir, exe); } catch { continue; }
-            if (File.Exists(candidate)) return candidate;
+            foreach (var ext in exts)
+            {
+                string candidate;
+                try { candidate = Path.Combine(dir, exe + ext); } catch { continue; }
+                if (File.Exists(candidate)) return candidate;
+            }
         }
         return null;
     }
@@ -75,6 +84,9 @@ public static class McpInstaller
             case "vscode" or "copilot":
                 InstallVsCode();
                 return true;
+            case "opencode":
+                InstallOpenCode();
+                return true;
             case "list":
                 ListStatus();
                 return true;
@@ -84,11 +96,11 @@ public static class McpInstaller
                 // WriteEarlyDispatchUsage. Otherwise scripts that capture stdout
                 // see the error text mixed into normal output.
                 Console.Error.WriteLine("Usage: officecli mcp uninstall <target>");
-                Console.Error.WriteLine("Targets: lms, claude, cursor, vscode");
+                Console.Error.WriteLine("Targets: lms, claude, cursor, vscode, opencode");
                 return false;
             default:
                 Console.Error.WriteLine($"Unknown target: {target}");
-                Console.Error.WriteLine("Supported: lms (LM Studio), claude (Claude Code), cursor, vscode (Copilot)");
+                Console.Error.WriteLine("Supported: lms (LM Studio), claude (Claude Code), cursor, vscode (Copilot), opencode");
                 Console.Error.WriteLine("Use 'officecli mcp list' to see current status.");
                 return false;
         }
@@ -111,6 +123,9 @@ public static class McpInstaller
                 return true;
             case "vscode" or "copilot":
                 UninstallJson("vscode", GetVsCodeMcpPath(), "mcpServers");
+                return true;
+            case "opencode":
+                UninstallJson("OpenCode", GetOpenCodeConfigPath(), "mcp");
                 return true;
             default:
                 Console.Error.WriteLine($"Unknown target: {target}");
@@ -233,6 +248,11 @@ public static class McpInstaller
                 UseShellExecute = false,
             };
             foreach (var a in args) psi.ArgumentList.Add(a);
+            // A bare executable name is resolved by .NET relative to the
+            // working directory before PATH on macOS/Linux, so the launch
+            // failed with "No such file or directory" even though the shell
+            // finds the CLI. Resolve it through PATH ourselves.
+            psi.FileName = ResolveOnPath(psi.FileName) ?? psi.FileName;
             using var p = Process.Start(psi);
             if (p == null) return false;
             // Async-drain both streams and bound the wait: the serial
@@ -273,9 +293,30 @@ public static class McpInstaller
     private static void InstallVsCode() =>
         InstallJson("VS Code Copilot", GetVsCodeMcpPath(), "mcpServers");
 
+    // ==================== OpenCode ====================
+
+    // Global config: <xdg config>/opencode/opencode.json — the same directory
+    // SkillInstaller targets. OpenCode merges config.json, opencode.json and
+    // opencode.jsonc from that directory, so writing opencode.json keeps a
+    // user's opencode.jsonc (comments and all) untouched. The entry shape is
+    // OpenCode's McpLocalConfig: {"type":"local","command":[exe,"mcp"]}.
+    private static string GetOpenCodeConfigPath() =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config", "opencode", "opencode.json");
+
+    private static void InstallOpenCode() =>
+        InstallJson("OpenCode", GetOpenCodeConfigPath(), "mcp", openCodeShape: true,
+            schemaUrl: "https://opencode.ai/config.json");
+
     // ==================== Generic JSON installer ====================
 
-    private static void InstallJson(string clientName, string configPath, string serversKey)
+    private static readonly JsonDocumentOptions LenientJson = new()
+    {
+        CommentHandling = JsonCommentHandling.Skip,
+        AllowTrailingCommas = true,
+    };
+
+    private static void InstallJson(string clientName, string configPath, string serversKey,
+        bool openCodeShape = false, string? schemaUrl = null)
     {
         var dir = Path.GetDirectoryName(configPath);
         if (dir != null) Directory.CreateDirectory(dir);
@@ -285,12 +326,14 @@ public static class McpInstaller
         {
             try
             {
-                using var doc = JsonDocument.Parse(File.ReadAllText(configPath));
+                using var doc = JsonDocument.Parse(File.ReadAllText(configPath), LenientJson);
                 foreach (var prop in doc.RootElement.EnumerateObject())
                     root[prop.Name] = prop.Value.Clone();
             }
             catch { /* start fresh if parse fails */ }
         }
+        if (schemaUrl != null && !root.ContainsKey("$schema"))
+            root["$schema"] = JsonDocument.Parse($"\"{schemaUrl}\"").RootElement.Clone();
 
         // Build the mcpServers section
         var servers = new Dictionary<string, object>();
@@ -303,7 +346,7 @@ public static class McpInstaller
             }
         }
 
-        servers["officecli"] = new McpServerEntry { Command = OfficecliPath, Args = ["mcp"] };
+        servers["officecli"] = new McpServerEntry { Command = OfficecliPath, Args = ["mcp"], OpenCodeShape = openCodeShape };
         root[serversKey] = servers;
 
         // Write with proper formatting using Utf8JsonWriter
@@ -341,10 +384,21 @@ public static class McpInstaller
             else if (kv.Value is McpServerEntry entry)
             {
                 w.WriteStartObject();
-                w.WriteString("command", entry.Command);
-                w.WriteStartArray("args");
-                foreach (var a in entry.Args) w.WriteStringValue(a);
-                w.WriteEndArray();
+                if (entry.OpenCodeShape)
+                {
+                    w.WriteString("type", "local");
+                    w.WriteStartArray("command");
+                    w.WriteStringValue(entry.Command);
+                    foreach (var a in entry.Args) w.WriteStringValue(a);
+                    w.WriteEndArray();
+                }
+                else
+                {
+                    w.WriteString("command", entry.Command);
+                    w.WriteStartArray("args");
+                    foreach (var a in entry.Args) w.WriteStringValue(a);
+                    w.WriteEndArray();
+                }
                 w.WriteEndObject();
             }
         }
@@ -361,7 +415,7 @@ public static class McpInstaller
 
         try
         {
-            using var doc = JsonDocument.Parse(File.ReadAllText(configPath));
+            using var doc = JsonDocument.Parse(File.ReadAllText(configPath), LenientJson);
             using var ms = new MemoryStream();
             using (var w = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = true }))
             {
@@ -414,10 +468,11 @@ public static class McpInstaller
         CheckJsonStatus("Claude Code", GetClaudeConfigPath());
         CheckJsonStatus("Cursor", GetCursorMcpPath());
         CheckJsonStatus("VS Code", GetVsCodeMcpPath());
+        CheckJsonStatus("OpenCode", GetOpenCodeConfigPath(), "mcp");
 
         Console.WriteLine();
         Console.WriteLine("Commands:");
-        Console.WriteLine("  officecli mcp <target>              Register (lms, claude, cursor, vscode)");
+        Console.WriteLine("  officecli mcp <target>              Register (lms, claude, cursor, vscode, opencode)");
         Console.WriteLine("  officecli mcp uninstall <target>    Unregister");
     }
 
@@ -427,15 +482,15 @@ public static class McpInstaller
         Console.WriteLine($"  {(exists ? "✓" : "✗")} {name,-15} {(exists ? "registered" : "not registered")}");
     }
 
-    private static void CheckJsonStatus(string name, string path)
+    private static void CheckJsonStatus(string name, string path, string serversKey = "mcpServers")
     {
         var registered = false;
         if (File.Exists(path))
         {
             try
             {
-                using var doc = JsonDocument.Parse(File.ReadAllText(path));
-                registered = doc.RootElement.TryGetProperty("mcpServers", out var servers)
+                using var doc = JsonDocument.Parse(File.ReadAllText(path), LenientJson);
+                registered = doc.RootElement.TryGetProperty(serversKey, out var servers)
                     && servers.TryGetProperty("officecli", out _);
             }
             catch { }
@@ -449,5 +504,6 @@ public static class McpInstaller
     {
         public string Command { get; set; } = "";
         public string[] Args { get; set; } = [];
+        public bool OpenCodeShape { get; set; }
     }
 }

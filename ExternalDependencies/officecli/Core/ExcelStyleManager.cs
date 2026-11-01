@@ -175,7 +175,12 @@ internal class ExcelStyleManager
         }
         else if (styleProps.TryGetValue("fill", out var fillColor) || styleProps.TryGetValue("bgcolor", out fillColor) || styleProps.TryGetValue("bg", out fillColor))
         {
-            if (fillColor.Contains('-') || fillColor.Contains(';'))
+            // The gradient heuristic below keys off '-', which a negative tint
+            // suffix ("accent1+tint-25") also carries — route on the color
+            // WITHOUT its tint suffix so a darkening tint isn't mistaken for a
+            // two-stop gradient.
+            var fillColorSansTint = ParseHelpers.SplitExcelColorTint(fillColor).BaseName;
+            if (fillColorSansTint.Contains('-') || fillColorSansTint.Contains(';'))
             {
                 // Gradient fill: "FF0000-0000FF[-90]" or "radial:FF0000-0000FF"
                 // Also handles semicolon format from Get: "gradient;FF0000;0000FF;90"
@@ -992,9 +997,13 @@ internal class ExcelStyleManager
         // When matched, store as <color theme="N"/> instead of rgb.
         string? color;
         uint? colorTheme = null;
+        double? colorTint = null;
         if (fontProps.TryGetValue("color", out var cVal))
         {
-            var schemeIdx = OfficeCli.Handlers.ExcelHandler.ExcelSchemeColorNameToThemeIndex(cVal);
+            // "accent1+tint40" — same suffix the fill path accepts.
+            var (cBase, cTint) = ParseHelpers.SplitExcelColorTint(cVal);
+            colorTint = cTint;
+            var schemeIdx = OfficeCli.Handlers.ExcelHandler.ExcelSchemeColorNameToThemeIndex(cBase);
             if (schemeIdx.HasValue)
             {
                 color = null;
@@ -1002,13 +1011,14 @@ internal class ExcelStyleManager
             }
             else
             {
-                color = NormalizeColor(cVal);
+                color = NormalizeColor(cBase);
             }
         }
         else
         {
             color = baseFont.Color?.Rgb?.Value;
             colorTheme = baseFont.Color?.Theme?.Value;
+            colorTint = baseFont.Color?.Tint?.Value;
         }
 
         // Long-tail children are added below (post-build) and dedup runs after
@@ -1047,9 +1057,9 @@ internal class ExcelStyleManager
         }
         newFont.Append(new FontSize { Val = size });
         if (colorTheme.HasValue)
-            newFont.Append(new Color { Theme = (UInt32Value)colorTheme.Value });
+            newFont.Append(WithTint(new Color { Theme = (UInt32Value)colorTheme.Value }, colorTint));
         else if (color != null)
-            newFont.Append(new Color { Rgb = color });
+            newFont.Append(WithTint(new Color { Rgb = color }, colorTint));
         newFont.Append(new FontName { Val = name });
 
         // Append long-tail children (charset, family, outline, shadow, condense,
@@ -1079,7 +1089,7 @@ internal class ExcelStyleManager
         int existingIdx = 0;
         foreach (var f in fonts.Elements<Font>())
         {
-            if (FontMatches(f, bold, italic, strike, underline, vertAlign, size, name, color, colorTheme)
+            if (FontMatches(f, bold, italic, strike, underline, vertAlign, size, name, color, colorTheme, colorTint)
                 && LongTailChildrenMatch(f, addedLongTail))
                 return (uint)existingIdx;
             existingIdx++;
@@ -1121,7 +1131,8 @@ internal class ExcelStyleManager
     }
 
     private static bool FontMatches(Font font, bool bold, bool italic, bool strike,
-        string? underline, string? vertAlign, double size, string name, string? color, uint? colorTheme = null)
+        string? underline, string? vertAlign, double size, string name, string? color,
+        uint? colorTheme = null, double? colorTint = null)
     {
         if ((font.Bold != null) != bold) return false;
         if ((font.Italic != null) != italic) return false;
@@ -1144,15 +1155,19 @@ internal class ExcelStyleManager
 
         var fontColor = font.Color?.Rgb?.Value;
         var fontColorTheme = font.Color?.Theme?.Value;
+        var fontColorTint = font.Color?.Tint?.Value;
         if (colorTheme.HasValue)
         {
             if (fontColorTheme != colorTheme.Value) return false;
             if (fontColor != null) return false;
+            // @tint is part of the color's identity — see ColorMatches.
+            if (!ParseHelpers.ExcelTintMatches(fontColorTint, colorTint)) return false;
         }
         else if (color != null)
         {
             if (!string.Equals(fontColor, color, StringComparison.OrdinalIgnoreCase)) return false;
             if (fontColorTheme != null) return false;
+            if (!ParseHelpers.ExcelTintMatches(fontColorTint, colorTint)) return false;
         }
         else
         {
@@ -1171,17 +1186,39 @@ internal class ExcelStyleManager
     // them back — otherwise a dump→batch round-trip of a theme-filled cell
     // rejects its own output (and, under atomic batch, rolls back the whole
     // replay over one fill).
-    private static (string? Rgb, uint? Theme) ResolveFillColor(string value)
+    private static (string? Rgb, uint? Theme, double? Tint) ResolveFillColor(string value)
     {
-        var schemeIdx = OfficeCli.Handlers.ExcelHandler.ExcelSchemeColorNameToThemeIndex(value);
-        return schemeIdx.HasValue ? (null, schemeIdx.Value) : (NormalizeColor(value), null);
+        // A `+tintNN` suffix rides on scheme names ("accent1+tint40"); a bare
+        // hex/name keeps a null tint so nothing below it changes.
+        var (baseName, tint) = ParseHelpers.SplitExcelColorTint(value);
+        var schemeIdx = OfficeCli.Handlers.ExcelHandler.ExcelSchemeColorNameToThemeIndex(baseName);
+        return schemeIdx.HasValue
+            ? (null, schemeIdx.Value, tint)
+            : (NormalizeColor(baseName), null, tint);
     }
 
-    private static bool ColorMatches(ColorType? c, string? rgb, uint? theme)
+    /// <summary>Apply the requested tint to a freshly built color element.
+    /// Absent/zero tint leaves the attribute off, matching what Excel writes
+    /// for an untinted theme color.</summary>
+    private static T WithTint<T>(T color, double? tint) where T : ColorType
+    {
+        if (tint is { } t && Math.Abs(t) >= ParseHelpers.ExcelTintEpsilon)
+            color.Tint = t;
+        return color;
+    }
+
+    // Dedup predicate for fill/pattern colors. The @tint comparison is NOT
+    // optional: Excel's stock palette stores "Accent1, Lighter 40%" as
+    // <fgColor theme="4" tint="0.4"/>, so a tint-blind match silently reused
+    // that pale variant for a plain `fill=accent1` and the cell rendered the
+    // wrong color with no new fill appended (issue #347 neighbourhood).
+    private static bool ColorMatches(ColorType? c, string? rgb, uint? theme, double? tint)
         => rgb != null
             ? string.Equals(c?.Rgb?.Value, rgb, StringComparison.OrdinalIgnoreCase)
+                && ParseHelpers.ExcelTintMatches(c?.Tint?.Value, tint)
             : theme != null
                 ? c?.Theme?.Value == theme.Value
+                    && ParseHelpers.ExcelTintMatches(c?.Tint?.Value, tint)
                 : c == null || (c.Rgb == null && c.Theme == null);
 
     /// <summary>
@@ -1199,9 +1236,10 @@ internal class ExcelStyleManager
         var fills = stylesheet.Fills!;
         var newPf = (PatternFill)existing.CloneNode(true);
         newPf.ForegroundColor?.Remove();
-        var (fgRgb, fgTheme) = ResolveFillColor(fgValue);
+        var (fgRgb, fgTheme, fgTint) = ResolveFillColor(fgValue);
         var fg = new ForegroundColor();
         if (fgRgb != null) fg.Rgb = fgRgb; else fg.Theme = fgTheme;
+        WithTint(fg, fgTint);
         // Schema order: fgColor FIRST, before any cloned bgColor.
         newPf.InsertAt(fg, 0);
 
@@ -1222,9 +1260,10 @@ internal class ExcelStyleManager
         var fills = stylesheet.Fills!;
         var newPf = (PatternFill)existing.CloneNode(true);
         newPf.BackgroundColor?.Remove();
-        var (bgRgb, bgTheme) = ResolveFillColor(bgValue);
+        var (bgRgb, bgTheme, bgTint) = ResolveFillColor(bgValue);
         var bg = new BackgroundColor();
         if (bgRgb != null) bg.Rgb = bgRgb; else bg.Theme = bgTheme;
+        WithTint(bg, bgTint);
         // Schema order: fgColor (cloned, stays first) then bgColor.
         newPf.Append(bg);
 
@@ -1256,7 +1295,7 @@ internal class ExcelStyleManager
                 stylesheet.Append(fills);
         }
 
-        var (rgb, theme) = ResolveFillColor(hexColor);
+        var (rgb, theme, tint) = ResolveFillColor(hexColor);
 
         // Search for existing match
         int idx = 0;
@@ -1264,7 +1303,7 @@ internal class ExcelStyleManager
         {
             var pf = fill.PatternFill;
             if (pf?.PatternType?.Value == PatternValues.Solid &&
-                ColorMatches(pf.ForegroundColor, rgb, theme))
+                ColorMatches(pf.ForegroundColor, rgb, theme, tint))
                 return (uint)idx;
             idx++;
         }
@@ -1272,6 +1311,7 @@ internal class ExcelStyleManager
         // Create new fill
         var fg = new ForegroundColor();
         if (rgb != null) fg.Rgb = rgb; else fg.Theme = theme;
+        WithTint(fg, tint);
         fills.Append(new Fill(new PatternFill(fg) { PatternType = PatternValues.Solid }));
         fills.Count = (uint)fills.Elements<Fill>().Count();
 
@@ -1328,16 +1368,16 @@ internal class ExcelStyleManager
 
         var pat = ParsePatternType(patternName) ?? PatternValues.Solid;
         // CONSISTENCY(scheme-color): pattern fg/bg accept scheme names too.
-        var (fgRgb, fgTheme) = fgHex != null ? ResolveFillColor(fgHex) : (null, (uint?)null);
-        var (bgRgb, bgTheme) = bgHex != null ? ResolveFillColor(bgHex) : (null, (uint?)null);
+        var (fgRgb, fgTheme, fgTint) = fgHex != null ? ResolveFillColor(fgHex) : (null, (uint?)null, (double?)null);
+        var (bgRgb, bgTheme, bgTint) = bgHex != null ? ResolveFillColor(bgHex) : (null, (uint?)null, (double?)null);
 
         int idx = 0;
         foreach (var fill in fills.Elements<Fill>())
         {
             var pf = fill.PatternFill;
             if (pf?.PatternType?.Value == pat
-                && (fgHex == null ? pf?.ForegroundColor == null : ColorMatches(pf?.ForegroundColor, fgRgb, fgTheme))
-                && (bgHex == null ? pf?.BackgroundColor == null : ColorMatches(pf?.BackgroundColor, bgRgb, bgTheme)))
+                && (fgHex == null ? pf?.ForegroundColor == null : ColorMatches(pf?.ForegroundColor, fgRgb, fgTheme, fgTint))
+                && (bgHex == null ? pf?.BackgroundColor == null : ColorMatches(pf?.BackgroundColor, bgRgb, bgTheme, bgTint)))
                 return (uint)idx;
             idx++;
         }
@@ -1348,12 +1388,14 @@ internal class ExcelStyleManager
         {
             var fg = new ForegroundColor();
             if (fgRgb != null) fg.Rgb = fgRgb; else fg.Theme = fgTheme;
+            WithTint(fg, fgTint);
             newPf.Append(fg);
         }
         if (bgHex != null)
         {
             var bg = new BackgroundColor();
             if (bgRgb != null) bg.Rgb = bgRgb; else bg.Theme = bgTheme;
+            WithTint(bg, bgTint);
             newPf.Append(bg);
         }
         fills.Append(new Fill(newPf));
@@ -1749,7 +1791,7 @@ internal class ExcelStyleManager
 
     // ==================== Helpers ====================
 
-    private static Stylesheet CreateDefaultStylesheet()
+    internal static Stylesheet CreateDefaultStylesheet()
     {
         return new Stylesheet(
             new NumberingFormats() { Count = 0 },

@@ -36,6 +36,20 @@ public partial class ExcelHandler : IDocumentHandler, Rendering.IRenderModelHost
     // Turns the O(n) linear scan in FindOrCreateCell into O(1) lookup + O(log n) insert.
     // Invalidated by InvalidateRowIndex() whenever rows are structurally modified (shift, remove).
     private Dictionary<SheetData, SortedList<uint, Row>>? _rowIndex;
+    // Shared-string index cache: SharedStringTable → its <si> items, in document
+    // order, materialized once per table.
+    // `Elements<SharedStringItem>()` is a lazy LINQ iterator (OfTypeIterator), so
+    // `ElementAtOrDefault(idx)` cannot use an index and walks from the head on
+    // every call — O(idx). Cells resolve in row order, so a sheet whose text cells
+    // use the shared-strings table costs sum(idx) ≈ n²/2 to read (issue #435:
+    // 40,000 rows took 21.5s, the same cells written inline 0.8s). Reading through
+    // this list makes each lookup O(1).
+    // Note the two obvious shortcuts are NOT available: measured on OpenXml 3.4.1,
+    // `ChildElements.Count` and `ChildElements[idx]` are themselves O(n) (1.2ms per
+    // call on a 100,000-item table), so neither can serve as a cheap validity check.
+    // Built lazily by SharedStringItems(); dropped by InvalidateSharedStringIndex()
+    // wherever the table grows, the same contract _rowIndex has.
+    private Dictionary<SharedStringTable, List<SharedStringItem>>? _sharedStringIndex;
     public int LastFindMatchCount { get; internal set; }
     // Number of elements a no-slash selector Set matched and mutated (Sheet1!row[...]).
     // Read by the CLI/resident to echo the multi-element change count.
@@ -47,6 +61,35 @@ public partial class ExcelHandler : IDocumentHandler, Rendering.IRenderModelHost
     /// trail. Pure Get/Query sessions leave this false.
     /// </summary>
     internal bool Modified { get; set; }
+
+    /// <summary>
+    /// Run a mutation with <see cref="Modified"/> raised, and put the flag back
+    /// the way it was if the mutation throws. Add/Set/Remove/RawSet used to set
+    /// the flag on entry, before any validation, so a command the handler
+    /// refused (unknown sheet, bad path) still took the Modified branch of
+    /// <see cref="Dispose"/>: the whole package was re-serialized, the
+    /// OfficeCLI.* audit stamp was written, and the file's hash changed for a
+    /// command that did nothing. A refused command must leave the file exactly
+    /// as it found it — the <c>!Modified</c> byte-preserving path in Dispose
+    /// already guarantees that once the flag is honest.
+    ///
+    /// This is all-or-nothing per command: a mutation that throws after
+    /// touching part of the DOM (a comma-list merge whose second range
+    /// overlaps) also persists nothing, which is what its success=false
+    /// envelope promises. Under a resident the partially touched in-memory DOM
+    /// is flushed by the next successful command — the batch path's
+    /// DiscardOnDispose rollback is the atomic mechanism there.
+    /// </summary>
+    private T MarkModified<T>(Func<T> mutation)
+    {
+        var wasModified = Modified;
+        Modified = true;
+        try { return mutation(); }
+        catch { Modified = wasModified; throw; }
+    }
+
+    private void MarkModified(Action mutation)
+        => MarkModified(() => { mutation(); return true; });
 
     /// <summary>
     /// Number of bare empty cell declarations removed at open by
@@ -115,10 +158,17 @@ public partial class ExcelHandler : IDocumentHandler, Rendering.IRenderModelHost
                     .Where(n => !string.IsNullOrEmpty(n)) ?? Enumerable.Empty<string>(),
                 StringComparer.OrdinalIgnoreCase);
         }
-        catch (DocumentFormat.OpenXml.Packaging.OpenXmlPackageException ex)
+        catch (Exception ex)
         {
-            throw new InvalidOperationException(
-                $"Cannot open {Path.GetFileName(filePath)}: {ex.Message}", ex);
+            // Release the file before the factory's repair-and-retry paths
+            // reopen it for an in-place fix (same cleanup as PowerPointHandler).
+            _doc?.Dispose();
+            _filteredPackageStream?.Dispose();
+            _backingStream?.Dispose();
+            if (ex is DocumentFormat.OpenXml.Packaging.OpenXmlPackageException)
+                throw new InvalidOperationException(
+                    $"Cannot open {Path.GetFileName(filePath)}: {ex.Message}", ex);
+            throw;
         }
     }
 
@@ -315,8 +365,20 @@ public partial class ExcelHandler : IDocumentHandler, Rendering.IRenderModelHost
     }
 
     public void RawSet(string partPath, string xpath, string action, string? xml)
+        => MarkModified(() =>
+        {
+            RawSetCore(partPath, xpath, action, xml);
+            // raw-set rewrites part XML directly, and it can reach the
+            // shared-strings table — `/sharedstrings`, or the same part by its zip
+            // URI. The read-side index mirrors that table by position, and a raw
+            // rewrite can remove or reorder items, not merely append; a stale list
+            // would then answer with the wrong item. Rebuilding costs one walk on
+            // the next read, so there is nothing to weigh here.
+            InvalidateSharedStringIndex();
+        });
+
+    private void RawSetCore(string partPath, string xpath, string action, string? xml)
     {
-        Modified = true;
         if (partPath == null) throw new ArgumentNullException(nameof(partPath));
         var workbookPart = _doc.WorkbookPart
             ?? throw new InvalidOperationException("No workbook part");
@@ -467,6 +529,16 @@ public partial class ExcelHandler : IDocumentHandler, Rendering.IRenderModelHost
     /// atomic-batch rollback: drop the in-memory DOM without serializing.</summary>
     public bool DiscardOnDispose { get; set; }
 
+    // #493: the final write-back used to be `catch { }` "best-effort: the
+    // original file is left intact". The file was intact, but the session's
+    // edits were silently gone — every non-resident add/set/remove reported
+    // success with exit 0, and a resident close reported a clean shutdown,
+    // whenever the save could not land (read-only directory, a sandboxed
+    // token on which ReplaceFile is denied, …). Resources are still released;
+    // the failure is then surfaced, but only when there were edits to lose.
+    private static IOException SaveFailed(string path, Exception inner) =>
+        new($"Could not save changes to {path}: {inner.Message} The file on disk is unchanged; the edits were not written.", inner);
+
     public void Dispose()
     {
         if (_disposed) return;
@@ -514,12 +586,14 @@ public partial class ExcelHandler : IDocumentHandler, Rendering.IRenderModelHost
         // may close the stream it was opened over during _doc.Dispose().
         // After _doc.Save() the in-memory zip is complete (same contract
         // the direct FileStream path relies on for mid-session saves).
-        try { WriteBackFilteredPackage(); } catch { /* best-effort */ }
+        Exception? writeError = null;
+        try { WriteBackFilteredPackage(); } catch (Exception ex) { writeError = ex; }
         _doc.Dispose();
         _filteredPackageStream?.Dispose();
         _filteredPackageStream = null;
         _backingStream?.Dispose();
         _backingStream = null;
+        if (writeError != null && Modified) throw SaveFailed(_filePath, writeError);
     }
 
 }

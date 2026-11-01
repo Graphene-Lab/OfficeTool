@@ -105,6 +105,8 @@ public partial class PowerPointHandler
 
         foreach (var element in shapeTree.ChildElements)
         {
+            // <p:cNvPr hidden="1"> — PowerPoint does not draw the shape (issue #466).
+            if (SlideComposition.IsHidden(element)) continue;
             switch (element)
             {
                 case Shape shape:
@@ -199,15 +201,23 @@ public partial class PowerPointHandler
             }
         }
 
+        foreach (var key in SlideComposition.HiddenMetadataSlotKeys(slidePart))
+            slidePlaceholders.Add(key);
+
+        // CONSISTENCY(layer-paint-order): master first, layout second — SVG paints
+        // in document order, so this is what puts master decoration at the bottom
+        // of the stack, the way PowerPoint composes the slide (issue #466,
+        // symptom 3). See PowerPointHandler.HtmlPreview.cs for the HTML twin.
         var layoutPart = slidePart.SlideLayoutPart;
+        var masterPart = layoutPart?.SlideMasterPart;
+
+        if (masterPart != null && SlideComposition.ShowMasterShapes(slidePart))
+            RenderInheritedShapesSvg(sb, defs, ref defId, masterPart.SlideMaster?.CommonSlideData?.ShapeTree,
+                masterPart, slidePlaceholders, themeColors);
+
         if (layoutPart != null)
             RenderInheritedShapesSvg(sb, defs, ref defId, layoutPart.SlideLayout?.CommonSlideData?.ShapeTree,
                 layoutPart, slidePlaceholders, themeColors);
-
-        var masterPart = layoutPart?.SlideMasterPart;
-        if (masterPart != null)
-            RenderInheritedShapesSvg(sb, defs, ref defId, masterPart.SlideMaster?.CommonSlideData?.ShapeTree,
-                masterPart, slidePlaceholders, themeColors);
     }
 
     private void RenderInheritedShapesSvg(StringBuilder sb, StringBuilder defs, ref int defId,
@@ -218,6 +228,10 @@ public partial class PowerPointHandler
 
         foreach (var element in shapeTree.ChildElements)
         {
+            // CONSISTENCY(hidden-gate): a decoration marked hidden stays hidden in the
+            // composition too — <p:cNvPr hidden="1"> means the shape is not drawn,
+            // wherever it lives, so this pass must not paint it onto the slide.
+            if (SlideComposition.IsHidden(element)) continue;
             if (element is not Shape shape) continue;
 
             var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
@@ -259,7 +273,7 @@ public partial class PowerPointHandler
         }
         else
         {
-            var resolved = ResolveInheritedPosition(shape, part);
+            var resolved = SlideComposition.ResolveInheritedPosition(shape, part);
             if (resolved == null)
             {
                 if (string.IsNullOrWhiteSpace(GetShapeText(shape))) return;
@@ -886,12 +900,29 @@ public partial class PowerPointHandler
         (long x, long y, long cx, long cy)? overridePos = null)
     {
         var xfrm = pic.ShapeProperties?.Transform2D;
-        if (xfrm?.Offset == null || xfrm?.Extents == null) return;
+        // Same frame rule as the HTML renderer: a picture filled into a picture
+        // placeholder carries <p:ph> and an empty spPr, so its frame comes from
+        // the layout/master slot via SlideComposition.
+        var pos = overridePos;
+        if (pos == null)
+        {
+            if (xfrm?.Offset != null && xfrm.Extents != null)
+                pos = (xfrm.Offset.X?.Value ?? 0, xfrm.Offset.Y?.Value ?? 0,
+                    xfrm.Extents.Cx?.Value ?? 0, xfrm.Extents.Cy?.Value ?? 0);
+            else
+            {
+                var picPh = pic.NonVisualPictureProperties?.ApplicationNonVisualDrawingProperties
+                    ?.GetFirstChild<PlaceholderShape>();
+                var inherited = SlideComposition.ResolveInheritedFrame(picPh, slidePart);
+                if (inherited != null) pos = (inherited.X, inherited.Y, inherited.Cx, inherited.Cy);
+            }
+        }
+        if (pos == null) return;
 
-        double px = EmuToPx(overridePos?.x ?? xfrm.Offset.X?.Value ?? 0);
-        double py = EmuToPx(overridePos?.y ?? xfrm.Offset.Y?.Value ?? 0);
-        double pw = EmuToPx(overridePos?.cx ?? xfrm.Extents.Cx?.Value ?? 0);
-        double ph = EmuToPx(overridePos?.cy ?? xfrm.Extents.Cy?.Value ?? 0);
+        double px = EmuToPx(pos.Value.x);
+        double py = EmuToPx(pos.Value.y);
+        double pw = EmuToPx(pos.Value.cx);
+        double ph = EmuToPx(pos.Value.cy);
         if (pw <= 0 || ph <= 0) return;
 
         // Extract image
@@ -916,7 +947,7 @@ public partial class PowerPointHandler
 
         // Transform
         var transforms = new List<string> { $"translate({px:0.##},{py:0.##})" };
-        if (xfrm.Rotation != null && xfrm.Rotation.Value != 0)
+        if (xfrm?.Rotation != null && xfrm.Rotation.Value != 0)
             transforms.Add($"rotate({xfrm.Rotation.Value / 60000.0:0.##},{pw / 2:0.##},{ph / 2:0.##})");
 
         // Clip for crop
@@ -968,6 +999,8 @@ public partial class PowerPointHandler
 
         foreach (var child in grp.ChildElements)
         {
+            // <p:cNvPr hidden="1"> — a hidden member stays hidden inside its group.
+            if (SlideComposition.IsHidden(child)) continue;
             switch (child)
             {
                 case Shape shape:

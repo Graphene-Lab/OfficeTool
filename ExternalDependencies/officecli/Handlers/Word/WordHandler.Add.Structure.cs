@@ -137,15 +137,9 @@ public partial class WordHandler
         // Ensure body-level sectPr has pgSz/pgMar (fix for docs created by older versions)
         var bodySectPr = body.GetFirstChild<SectionProperties>();
         if (bodySectPr != null && bodySectPr.GetFirstChild<PageSize>() == null)
-        {
-            bodySectPr.InsertBefore(new PageSize { Width = WordPageDefaults.A4WidthTwips, Height = WordPageDefaults.A4HeightTwips },
-                bodySectPr.GetFirstChild<DocGrid>());
-        }
+            InsertSectPrChildInOrder(bodySectPr, new PageSize { Width = WordPageDefaults.A4WidthTwips, Height = WordPageDefaults.A4HeightTwips });
         if (bodySectPr != null && bodySectPr.GetFirstChild<PageMargin>() == null)
-        {
-            bodySectPr.InsertBefore(new PageMargin { Top = 1440, Right = 1800U, Bottom = 1440, Left = 1800U },
-                bodySectPr.GetFirstChild<DocGrid>());
-        }
+            InsertSectPrChildInOrder(bodySectPr, new PageMargin { Top = 1440, Right = 1800U, Bottom = 1440, Left = 1800U });
 
         // BUG-DUMP-R31-1: a bare round-tripped section carries no page geometry.
         // The source's childless sectPr had neither pgSz nor pgMar, so stamping
@@ -1085,16 +1079,21 @@ public partial class WordHandler
     }
 
     // ==================== CT_Style schema-order insertion ====================
-    // BUG-DUMP-STYLE-LATENT: canonical CT_Style child order (subset, in
-    // document order):
+    // BUG-DUMP-STYLE-LATENT: canonical CT_Style child order, in document order
+    // (ISO/IEC 29500-4 CT_Style — the same order the SDK's compiled particle for
+    // w:style reports):
     //   name, aliases, basedOn, next, link, autoRedefine, hidden,
     //   uiPriority, semiHidden, unhideWhenUsed, qFormat, locked,
-    //   personalCompose, personalReply, personal, rPr, pPr, tblPr, trPr, tcPr,
-    //   tblStylePr.
+    //   personal, personalCompose, personalReply, rsid, pPr, rPr,
+    //   tblPr, trPr, tcPr, tblStylePr.
     // Word and the OOXML validator reject out-of-order children, so a Set that
     // inserts a latent-style flag onto a style that already has pPr/rPr must
     // place it ahead of those. AddStyle appends in this order already; Set uses
-    // this helper to splice into the right slot. Maps a child to its rank.
+    // this helper to splice into the right slot — and InsertStyleChild does the
+    // same for the name/basedOn/next/link and pPr/rPr containers through the
+    // SDK's own particle (issue #434). Maps a child to its rank; 99 = not ranked
+    // here (tblStylePr is last in CT_Style anyway, and an unknown extension still
+    // sorts after every ranked child).
     private static int StyleChildOrder(OpenXmlElement el) => el switch
     {
         StyleName => 0,
@@ -1109,8 +1108,15 @@ public partial class WordHandler
         UnhideWhenUsed => 9,
         PrimaryStyle => 10,   // <w:qFormat/>
         Locked => 11,
-        StyleParagraphProperties => 14,
-        StyleRunProperties => 13,
+        Personal => 12,
+        PersonalCompose => 13,
+        PersonalReply => 14,
+        Rsid => 15,
+        StyleParagraphProperties => 16,
+        StyleRunProperties => 17,
+        StyleTableProperties => 18,
+        TableStyleConditionalFormattingTableRowProperties => 19,   // <w:trPr/>
+        StyleTableCellProperties => 20,
         _ => 99,
     };
 
@@ -1163,9 +1169,14 @@ public partial class WordHandler
         var explicitName = properties.ContainsKey("name")
             || properties.ContainsKey("styleName")
             || properties.ContainsKey("stylename");
+        // A built-in id without an explicit name gets Word's display name for
+        // it: Word keys built-ins by name, so `add --type style id=Heading2`
+        // with an empty <w:name> is a nameless custom style to Word (body
+        // text) even though this tool's outline resolves it (issue #407).
         var styleName = properties.GetValueOrDefault("name")
                      ?? properties.GetValueOrDefault("styleName")
                      ?? properties.GetValueOrDefault("stylename")
+                     ?? BuiltInStyleName(styleId)
                      ?? (explicitName ? styleId : "");
         var styleType = properties.GetValueOrDefault("type", "paragraph").ToLowerInvariant() switch
         {
@@ -1345,7 +1356,11 @@ public partial class WordHandler
         // the decomposition's exact-element-multiset guarantee). BUG-R7-08
         // (never default the name to the id) is still honored: no name in, no name
         // out. An explicit empty name (name="" passed) still emits <w:name w:val=""/>.
-        if (explicitName)
+        // Exception (issue #407): a built-in id (Heading1, Title, …) always
+        // gets its Word display name — Word keys built-ins by name, so a
+        // nameless "Heading2" is a custom body-text style to it. A source
+        // document's built-ins carry their names, so dump→batch is unaffected.
+        if (explicitName || BuiltInStyleName(styleId) != null)
             newStyle.AppendChild(new StyleName { Val = styleName });
 
         if ((properties.TryGetValue("basedon", out var basedOn) || properties.TryGetValue("basedOn", out basedOn)) && !string.IsNullOrEmpty(basedOn))
@@ -2015,6 +2030,25 @@ public partial class WordHandler
 
         var resultPath = $"/styles/{styleId}";
         return resultPath;
+    }
+
+    /// <summary>
+    /// The abstractNumId / numId values currently defined in the numbering
+    /// part. Used by the batch pre-pass (BatchCompat.RemapNumberingIds) to
+    /// detect collisions when a dump of another document's numbering is
+    /// replayed into this one.
+    /// </summary>
+    internal (HashSet<int> AbstractNumIds, HashSet<int> NumIds) GetNumberingDefinitionIds()
+    {
+        var abs = new HashSet<int>();
+        var nums = new HashSet<int>();
+        var numbering = _doc.MainDocumentPart?.NumberingDefinitionsPart?.Numbering;
+        if (numbering == null) return (abs, nums);
+        foreach (var a in numbering.Elements<AbstractNum>())
+            if (a.AbstractNumberId?.Value is int aid) abs.Add(aid);
+        foreach (var n in numbering.Elements<NumberingInstance>())
+            if (n.NumberID?.Value is int nid) nums.Add(nid);
+        return (abs, nums);
     }
 
     /// <summary>

@@ -69,7 +69,7 @@ public partial class PowerPointHandler
             var masters = PowerPointHandler.MastersInOrder(presentationPart);
             if (mIdx < 1 || mIdx > masters.Count)
                 throw new ArgumentException($"Slide master {mIdx} not found (total: {masters.Count})");
-            var layouts = masters[mIdx - 1].SlideLayoutParts.ToList();
+            var layouts = PowerPointHandler.LayoutsInOrder(masters[mIdx - 1]);
             if (lIdx < 1 || lIdx > layouts.Count)
                 throw new ArgumentException($"Slide layout {lIdx} not found under master {mIdx} (total: {layouts.Count})");
             var lp = layouts[lIdx - 1];

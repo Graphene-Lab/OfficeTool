@@ -214,6 +214,9 @@ public partial class WordHandler
         }
         properties.Remove("done");
         properties.Remove("resolved");
+        // Whatever sidecar parts the document already carries get their entry
+        // for this comment too (issue #429) — no-op on a document without them.
+        SyncNewCommentSidecars(commentBody);
 
         var _commentUnsupported = new List<string>();
         ApplyCommentFormatKeys(commentEl, properties, _commentUnsupported);

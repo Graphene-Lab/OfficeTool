@@ -744,8 +744,7 @@ internal static partial class PivotTableHelper
             var key = outerCol[r];
             if (string.IsNullOrEmpty(key)) continue;
             if (r >= valueCol.Length) continue;
-            if (!double.TryParse(valueCol[r], System.Globalization.NumberStyles.Any,
-                    System.Globalization.CultureInfo.InvariantCulture, out var v))
+            if (!NumericText.TryParse(valueCol[r], out var v))
                 continue;
             if (!buckets.TryGetValue(key, out var list))
             {
@@ -1030,7 +1029,7 @@ internal static partial class PivotTableHelper
             for (int i = 0; i < headers.Length; i++)
             {
                 if (!rowFields.Contains(i) && !colFields.Contains(i) && !filterFields.Contains(i)
-                    && columnData[i].All(v => double.TryParse(v, System.Globalization.CultureInfo.InvariantCulture, out _)))
+                    && columnData[i].All(v => NumericText.TryParse(v, out _)))
                 {
                     valueFields.Add((i, "sum", "normal", $"Sum of {headers[i]}"));
                     break;

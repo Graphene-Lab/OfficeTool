@@ -1160,6 +1160,8 @@ public partial class PowerPointHandler
                         _ => new Drawing.ShapeTypeValues(value),
                     };
                     prstGeom.Preset = resolvedShape;
+                    // elbow → straight must not keep the elbow's adj1 (#235).
+                    ReconcileAdjustGuides(prstGeom);
                     break;
                 }
                 case "headend" or "headEnd":
@@ -1637,7 +1639,12 @@ public partial class PowerPointHandler
             {
                 var chartRef = chartGf.Descendants<DocumentFormat.OpenXml.Drawing.Charts.ChartReference>().FirstOrDefault();
                 if (chartRef?.Id?.Value != null && slidePart.GetPartById(chartRef.Id.Value) is ChartPart cp)
+                {
+                    // #452: keep an embedded chart workbook in step with the data.
+                    var embeddedData = ChartEmbeddedDataSync.Capture(cp);
                     unsupported.AddRange(ChartHelper.SetChartProperties(cp, chartProps));
+                    ChartEmbeddedDataSync.Restore(cp, embeddedData);
+                }
                 else
                     unsupported.AddRange(chartProps.Keys);
             }
@@ -1949,7 +1956,7 @@ public partial class PowerPointHandler
         catch
         {
             // Rollback: restore shape to pre-modification state
-            shape.Parent?.ReplaceChild(shapeBackup, shape);
+            OfficeCli.Core.ElementRollback.RestoreInPlace(shape, shapeBackup);
             throw;
         }
     }

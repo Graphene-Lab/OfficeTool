@@ -652,4 +652,11 @@ public partial class ExcelHandler
         => CanonicalNumericLiteral.IsMatch(text)
             ? text
             : parsed.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Guard for every numeric AUTO-DETECTION on a cell value — see
+    /// <see cref="Core.NumericText"/> for why "1,5" must not become 15.
+    /// </summary>
+    internal static bool HasValidThousandsGrouping(string text)
+        => Core.NumericText.HasValidThousandsGrouping(text);
 }

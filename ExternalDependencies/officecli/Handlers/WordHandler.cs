@@ -161,6 +161,26 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
     internal bool Modified { get; set; }
 
     /// <summary>
+    /// Run a mutation with <see cref="Modified"/> raised, and put the flag back
+    /// the way it was if the mutation throws. The entry points used to raise
+    /// the flag before any validation, so a refused command (missing path,
+    /// no-match xpath) still had the OfficeCLI.* audit stamp written on
+    /// Dispose — a file marked as modified by a command that did nothing.
+    /// Move/Swap/CopyFrom/AddPart never raised it at all, so a successful one
+    /// left no stamp. Same helper as ExcelHandler.
+    /// </summary>
+    private T MarkModified<T>(Func<T> mutation)
+    {
+        var wasModified = Modified;
+        Modified = true;
+        try { return mutation(); }
+        catch { Modified = wasModified; throw; }
+    }
+
+    private void MarkModified(Action mutation)
+        => MarkModified(() => { mutation(); return true; });
+
+    /// <summary>
     /// When true, per-mutation <c>Document.Save()</c> calls are skipped — the
     /// in-memory DOM stays authoritative and is serialized once at Dispose
     /// (AutoSave) / explicit flush. Set by the batch driver around a replay so
@@ -1567,8 +1587,10 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
     }
 
     public void RawSet(string partPath, string xpath, string action, string? xml)
+        => MarkModified(() => RawSetCore(partPath, xpath, action, xml));
+
+    private void RawSetCore(string partPath, string xpath, string action, string? xml)
     {
-        Modified = true;
         ClearBodyChildIndex(); // raw-set may rewrite the body / its paragraph set
         if (partPath == null) throw new ArgumentNullException(nameof(partPath));
         var mainPart = _doc.MainDocumentPart
@@ -2455,8 +2477,24 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
             postProcessTemp: postProcessTemp);
     }
 
+    // #493: the final write-back used to be `catch { }` "best-effort: the
+    // original file is left intact". The file was intact, but the session's
+    // edits were silently gone — every non-resident add/set/remove reported
+    // success with exit 0, and a resident close reported a clean shutdown,
+    // whenever the save could not land (read-only directory, a sandboxed
+    // token on which ReplaceFile is denied, …). Resources are still released;
+    // the failure is then surfaced, but only when there were edits to lose.
+    private static IOException SaveFailed(string path, Exception inner) =>
+        new($"Could not save changes to {path}: {inner.Message} The file on disk is unchanged; the edits were not written.", inner);
+
+    // Dispose is idempotent: DeferredStdout disposes the handler to commit the
+    // save before a command prints, and the command's `using` disposes it again.
+    private bool _disposeDone;
+
     public void Dispose()
     {
+        if (_disposeDone) return;
+        _disposeDone = true;
         if (DiscardOnDispose)
         {
             // Atomic-batch rollback: never serialize the poisoned DOM. Close
@@ -2476,8 +2514,21 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
             try { OfficeCli.Core.OfficeCliMetadata.StampOnSave(_doc); }
             catch { /* best-effort audit trail */ }
         }
-        try { _doc.Save(); } catch { /* read-only or already disposed */ }
-        if (_packageStream != null)
+        // Nothing changed (e.g. a set whose every prop was unsupported): do not
+        // re-serialise or write the package — leave the file byte-identical, as
+        // the xlsx handler already does. Saving an untouched package rewrote
+        // document.xml and made a no-op command look like an edit.
+        if (Modified)
+            try { _doc.Save(); } catch { /* read-only or already disposed */ }
+        if (_packageStream != null && !Modified)
+        {
+            try { _doc.Dispose(); } catch { /* already closed */ }
+            _packageStream.Dispose();
+            _packageStream = null;
+            _backingStream?.Dispose();
+            _backingStream = null;
+        }
+        else if (_packageStream != null)
         {
             // Editable: read the in-memory package into the atomic temp BEFORE
             // _doc.Dispose() (the SDK may close the stream it was opened over on
@@ -2487,6 +2538,7 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
             //    persist on a stream-opened package (see RawReplaceWholePart).
             //  - NormalizeSelfClosingInDocx: canonicalize `<w:br />` -> `<w:br/>`
             //    (schema-equivalent; several consumers/tests want the short form).
+            Exception? writeError = null;
             try
             {
                 AtomicWriteBack(tmp =>
@@ -2495,12 +2547,13 @@ public partial class WordHandler : IDocumentHandler, Rendering.IRenderModelHost
                     NormalizeSelfClosingInDocx(tmp);
                 });
             }
-            catch { /* best-effort: the original file is left intact */ }
+            catch (Exception ex) { writeError = ex; }
             _doc.Dispose();
             _packageStream.Dispose();
             _packageStream = null;
             _backingStream?.Dispose();
             _backingStream = null;
+            if (writeError != null && Modified) throw SaveFailed(_filePath, writeError);
         }
         else
         {

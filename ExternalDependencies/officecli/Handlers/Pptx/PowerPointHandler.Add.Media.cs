@@ -710,10 +710,17 @@ public partial class PowerPointHandler
                 // Schema documents both 2- and 4-arg forms; explicit
                 // `x=`/`y=`/`width=`/`height=` props still override anchor
                 // for that axis (matches OLE/picture/shape add convention).
-                long chartX = properties.TryGetValue("x", out var xv) ? ParseEmu(xv) : 838200;     // ~2.3cm
-                long chartY = properties.TryGetValue("y", out var yv) ? ParseEmu(yv) : 1825625;     // ~5cm
-                long chartCx = properties.TryGetValue("width", out var wv) || properties.TryGetValue("w", out wv) ? ParseEmu(wv) : 8229600; // ~22.9cm
-                long chartCy = properties.TryGetValue("height", out var hv) || properties.TryGetValue("h", out hv) ? ParseEmu(hv) : 4572000; // ~12.7cm
+                // Default frame is authored for a 13.33in x 7.5in slide; scale it to
+                // the deck's slide size so it stays inside a 4:3 or 10in deck
+                // (#460 class — same rule as the title/text placeholders).
+                var (slideW, slideH) = GetSlideSize();
+                double fx = slideW / (double)SlideSizeDefaults.Widescreen16x9Cx;
+                double fy = slideH / (double)SlideSizeDefaults.Widescreen16x9Cy;
+                static long ScaleEmu(long emu, double f) => f == 1.0 ? emu : (long)Math.Round(emu * f / 12700.0) * 12700L;
+                long chartX = properties.TryGetValue("x", out var xv) ? ParseEmu(xv) : ScaleEmu(838200, fx);     // ~2.3cm
+                long chartY = properties.TryGetValue("y", out var yv) ? ParseEmu(yv) : ScaleEmu(1825625, fy);     // ~5cm
+                long chartCx = properties.TryGetValue("width", out var wv) || properties.TryGetValue("w", out wv) ? ParseEmu(wv) : ScaleEmu(8229600, fx); // ~22.9cm
+                long chartCy = properties.TryGetValue("height", out var hv) || properties.TryGetValue("h", out hv) ? ParseEmu(hv) : ScaleEmu(4572000, fy); // ~12.7cm
                 if (properties.TryGetValue("anchor", out var chartAnchorRaw) && !string.IsNullOrWhiteSpace(chartAnchorRaw))
                 {
                     var anchorParts = chartAnchorRaw.Split(',', StringSplitOptions.TrimEntries);

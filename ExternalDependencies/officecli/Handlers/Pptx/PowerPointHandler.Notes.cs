@@ -12,23 +12,48 @@ public partial class PowerPointHandler
 {
     // ==================== Speaker Notes helpers ====================
 
-    private static string GetNotesText(NotesSlidePart notesPart)
-    {
-        var spTree = notesPart.NotesSlide?.CommonSlideData?.ShapeTree;
-        if (spTree == null) return "";
+    /// <summary>
+    /// Locate the speaker-notes body shape on a notes slide: the placeholder
+    /// whose <c>type</c> is <c>body</c>. Issue #403: the body used to be found
+    /// by <c>idx == 1</c>, but the index is inherited from the notes master
+    /// and is not fixed — python-pptx emits <c>&lt;p:ph type="body" idx="3"/&gt;</c>.
+    /// Matching on the type is the only stable rule, and it also keeps a
+    /// header placeholder that happens to sit at idx=1 from being taken for
+    /// the body. Every notes read/write site must go through this helper.
+    /// </summary>
+    private static Shape? FindNotesBodyShape(ShapeTree? spTree)
+        => FindNotesBodyShapes(spTree).FirstOrDefault();
 
+    /// <summary>
+    /// Every body placeholder on the notes slide, in document order. A notes
+    /// slide normally carries one, but decks that passed through several
+    /// tools (and files written by older OfficeCLI builds, which appended an
+    /// idx="1" body next to a foreign idx="3" one) can carry more; PowerPoint
+    /// renders all of them on the notes page.
+    /// </summary>
+    private static List<Shape> FindNotesBodyShapes(ShapeTree? spTree)
+    {
+        var result = new List<Shape>();
+        if (spTree == null) return result;
         foreach (var shape in spTree.Elements<Shape>())
         {
             var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
                 ?.GetFirstChild<PlaceholderShape>();
-            if (ph?.Index?.Value == 1) // body/notes placeholder
-            {
-                return string.Join("\n", shape.TextBody?.Elements<Drawing.Paragraph>()
-                    .Select(p => string.Concat(p.Elements<Drawing.Run>().Select(r => r.Text?.Text ?? "")))
-                    ?? Enumerable.Empty<string>());
-            }
+            if (ph?.Type?.Value == PlaceholderValues.Body) result.Add(shape);
         }
-        return "";
+        return result;
+    }
+
+    private static string GetNotesText(NotesSlidePart notesPart)
+    {
+        // Concatenate every body placeholder: text left in a second body
+        // must stay visible to readers, not only to PowerPoint.
+        var lines = FindNotesBodyShapes(notesPart.NotesSlide?.CommonSlideData?.ShapeTree)
+            .SelectMany(shape => shape.TextBody?.Elements<Drawing.Paragraph>()
+                .Select(p => string.Concat(p.Elements<Drawing.Run>().Select(r => r.Text?.Text ?? "")))
+                ?? Enumerable.Empty<string>())
+            .ToList();
+        return string.Join("\n", lines);
     }
 
     /// <summary>
@@ -39,15 +64,7 @@ public partial class PowerPointHandler
     /// </summary>
     private static void PopulateNotesFormat(NotesSlidePart notesPart, DocumentNode node)
     {
-        var spTree = notesPart.NotesSlide?.CommonSlideData?.ShapeTree;
-        if (spTree == null) return;
-        Shape? notesShape = null;
-        foreach (var shape in spTree.Elements<Shape>())
-        {
-            var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
-                ?.GetFirstChild<PlaceholderShape>();
-            if (ph?.Index?.Value == 1) { notesShape = shape; break; }
-        }
+        var notesShape = FindNotesBodyShape(notesPart.NotesSlide?.CommonSlideData?.ShapeTree);
         if (notesShape == null) return;
         var firstRun = notesShape.TextBody?
             .Elements<Drawing.Paragraph>()
@@ -74,24 +91,23 @@ public partial class PowerPointHandler
         var spTree = notesPart.NotesSlide?.CommonSlideData?.ShapeTree
             ?? throw new InvalidOperationException("Notes slide has no shape tree");
 
-        // Find body placeholder (idx=1)
-        Shape? notesShape = null;
-        foreach (var shape in spTree.Elements<Shape>())
-        {
-            var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
-                ?.GetFirstChild<PlaceholderShape>();
-            if (ph?.Index?.Value == 1)
-            {
-                notesShape = shape;
-                break;
-            }
-        }
+        var bodies = FindNotesBodyShapes(spTree);
+        var notesShape = bodies.FirstOrDefault();
+        // The text replaces the whole notes page. Surplus body placeholders
+        // would keep their old text (rendered by PowerPoint, hidden from
+        // readers that only consult the first body), so drop them.
+        foreach (var extra in bodies.Skip(1)) extra.Remove();
 
         if (notesShape == null)
         {
+            // No body placeholder at all: create one. The shape id must not
+            // collide with the ids already in the tree (the old hardcoded 3
+            // duplicated the sldImg/body ids on foreign files — issue #403).
+            var nextId = (spTree.Descendants<NonVisualDrawingProperties>()
+                .Select(c => c.Id?.Value ?? 0u).DefaultIfEmpty(0u).Max()) + 1;
             notesShape = new Shape(
                 new NonVisualShapeProperties(
-                    new NonVisualDrawingProperties { Id = 3, Name = "Notes Placeholder 2" },
+                    new NonVisualDrawingProperties { Id = nextId, Name = "Notes Placeholder 2" },
                     new NonVisualShapeDrawingProperties(),
                     new ApplicationNonVisualDrawingProperties(
                         new PlaceholderShape { Type = PlaceholderValues.Body, Index = 1 }
@@ -129,19 +145,7 @@ public partial class PowerPointHandler
     /// </summary>
     private static void ApplyNotesDirection(NotesSlidePart notesPart, string value)
     {
-        var spTree = notesPart.NotesSlide?.CommonSlideData?.ShapeTree;
-        if (spTree == null) return;
-        Shape? notesShape = null;
-        foreach (var shape in spTree.Elements<Shape>())
-        {
-            var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
-                ?.GetFirstChild<PlaceholderShape>();
-            if (ph?.Index?.Value == 1)
-            {
-                notesShape = shape;
-                break;
-            }
-        }
+        var notesShape = FindNotesBodyShape(notesPart.NotesSlide?.CommonSlideData?.ShapeTree);
         if (notesShape == null) return;
         bool rtl = ParsePptDirectionRtl(value);
         foreach (var para in notesShape.TextBody?.Elements<Drawing.Paragraph>() ?? Enumerable.Empty<Drawing.Paragraph>())

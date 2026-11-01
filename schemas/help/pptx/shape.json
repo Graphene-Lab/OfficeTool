@@ -87,7 +87,7 @@
     },
     "adj": {
       "type": "string",
-      "description": "Preset adjust handles (a:prstGeom/a:avLst/a:gd). Controls the parametric proportions of a preset (arrow tail/head size, roundRect corner radius, star inner ratio, etc.). Format is \"name:formula\" where formula is an OOXML guide formula such as \"val 6000\". Multiple handles are comma-separated.",
+      "description": "Preset adjust handles (a:prstGeom/a:avLst/a:gd). Controls the parametric proportions of a preset (arrow tail/head size, roundRect corner radius, star inner ratio, etc.). Format is \"name:formula\" where formula is an OOXML guide formula such as \"val 6000\". Multiple handles are comma-separated. Handle names are defined by the geometry: a preset with one handle names it \"adj\" (roundRect, triangle, chevron; a lone \"adj1\" there is renamed to \"adj\"), multi-handle presets use their own names (leftArrow: adj1, adj2), and presets such as rect/ellipse have none. A name the geometry does not declare is rejected, because PowerPoint refuses such a file. Changing geometry drops the handles the new preset does not declare.",
       "aliases": [],
       "add": true,
       "set": true,
@@ -95,7 +95,7 @@
       "examples": [
         "--prop geometry=leftArrow --prop adj=adj1:val 80000",
         "--prop geometry=roundRect --prop adj=adj:val 16667",
-        "--prop adj=\"adj1:val 6000,adj2:val 12000\""
+        "--prop geometry=rightArrow --prop adj=\"adj1:val 60000,adj2:val 40000\""
       ],
       "readback": "comma-separated name:formula handles (e.g. \"adj1:val 80000\")",
       "enforcement": "lenient"
@@ -335,14 +335,14 @@
     },
     "kern": {
       "type": "number",
-      "description": "minimum kerning size in 1/100 pt (drawingML rPr/@kern). Get surfaces the raw integer via long-tail rPr attribute readback.",
+      "description": "minimum kerning size in 1/100 pt (drawingML rPr/@kern). kern lives per-run — a shape has no kerning threshold of its own, only an aggregate of its runs' rPr. add/set on a shape is a convenience that writes the runs; read it back at run scope (/shape[N]/paragraph[P]/run[R]). Not surfaced at shape level: the first-run projection could not be replayed, because `add textbox kern=…` meets a runless shape before the text is set and materialises a paragraph default (<a:pPr><a:defRPr kern=…>) the source never had — every sibling run without an explicit kern then inherited it.",
       "add": true,
       "set": true,
-      "get": true,
+      "get": false,
       "examples": [
         "--prop kern=1200"
       ],
-      "readback": "integer",
+      "readback": "run scope only (/shape[N]/paragraph[P]/run[R])",
       "enforcement": "report"
     },
     "autoFit": {
@@ -1118,6 +1118,15 @@
       ],
       "enforcement": "report",
       "readback": "length string (FormatEmu)"
-    }
+    },
+    "effective.x": {"type": "length", "add": false, "set": false, "get": true, "description": "resolved x inherited from the layout/master placeholder slot when the element carries no own xfrm; absent when the element owns its frame (bare x is reported instead).", "readback": "length string", "enforcement": "report"},
+    "effective.x.src": {"type": "string", "add": false, "set": false, "get": true, "description": "slot that supplies effective.x, e.g. /slide[1]/layout/ph[@type=pic][@idx=1].", "readback": "path string", "enforcement": "report"},
+    "effective.y": {"type": "length", "add": false, "set": false, "get": true, "description": "resolved y inherited from the layout/master placeholder slot when the element carries no own xfrm; absent when the element owns its frame (bare y is reported instead).", "readback": "length string", "enforcement": "report"},
+    "effective.y.src": {"type": "string", "add": false, "set": false, "get": true, "description": "slot that supplies effective.y, e.g. /slide[1]/layout/ph[@type=pic][@idx=1].", "readback": "path string", "enforcement": "report"},
+    "effective.width": {"type": "length", "add": false, "set": false, "get": true, "description": "resolved width inherited from the layout/master placeholder slot when the element carries no own xfrm; absent when the element owns its frame (bare width is reported instead).", "readback": "length string", "enforcement": "report"},
+    "effective.width.src": {"type": "string", "add": false, "set": false, "get": true, "description": "slot that supplies effective.width, e.g. /slide[1]/layout/ph[@type=pic][@idx=1].", "readback": "path string", "enforcement": "report"},
+    "effective.height": {"type": "length", "add": false, "set": false, "get": true, "description": "resolved height inherited from the layout/master placeholder slot when the element carries no own xfrm; absent when the element owns its frame (bare height is reported instead).", "readback": "length string", "enforcement": "report"},
+    "effective.height.src": {"type": "string", "add": false, "set": false, "get": true, "description": "slot that supplies effective.height, e.g. /slide[1]/layout/ph[@type=pic][@idx=1].", "readback": "path string", "enforcement": "report"},
+    "hidden": {"type": "bool", "add": false, "set": false, "get": true, "description": "true when <p:cNvPr hidden=\"1\"> marks the element as not drawn; the HTML/SVG previews skip it. Not the slide-level hidden (show=\"0\").", "readback": "true only", "enforcement": "report"}
   }
 }

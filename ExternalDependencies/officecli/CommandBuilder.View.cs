@@ -126,7 +126,9 @@ static partial class CommandBuilder
                 if (colsStr != null) req.Args["cols"] = colsStr;
                 if (pageFilter != null) req.Args["page"] = pageFilter;
                 if (browser) req.Args["browser"] = "true";
-                if (outArg != null) req.Args["out"] = outArg;
+                // Absolute: the resident resolves relative paths against ITS
+                // working directory, not the caller's.
+                if (outArg != null) req.Args["out"] = Path.GetFullPath(outArg);
                 if (clipArg != null) req.Args["range"] = clipArg;
                 req.Args["screenshot-width"] = screenshotWidth.ToString();
                 req.Args["screenshot-height"] = screenshotHeight.ToString();
@@ -135,565 +137,9 @@ static partial class CommandBuilder
                 if (withPages) req.Args["page-count"] = "true";
             }, json) is {} rc) return rc;
 
-            var format = json ? OutputFormat.Json : OutputFormat.Text;
-            var cols = colsStr != null ? new HashSet<string>(colsStr.Split(',').Select(c => c.Trim().ToUpperInvariant())) : null;
-
             using var handler = DocumentHandlerFactory.Open(file.FullName);
-
-            if (mode.ToLowerInvariant() is "html" or "h")
-            {
-                string? html = null;
-                if (handler is OfficeCli.Handlers.PowerPointHandler pptHandler)
-                {
-                    // BUG-R36-B7: --page on pptx html previously fell through to
-                    // start/end via the parser default (no value), so --page 99
-                    // silently rendered all slides. Honor --page with strict
-                    // range checking, matching SVG mode's CONSISTENCY(strict-page).
-                    var (pStart, pEnd) = ParsePptHtmlPage(pageFilter, start, end, pptHandler);
-                    html = RenderViaRegistry(handler, "pptx",
-                        new OfficeCli.Core.Rendering.RenderOptions { StartPage = pStart, EndPage = pEnd });
-                }
-                else if (handler is OfficeCli.Handlers.ExcelHandler)
-                    html = RenderViaRegistry(handler, "xlsx", new OfficeCli.Core.Rendering.RenderOptions());
-                else if (handler is OfficeCli.Handlers.WordHandler)
-                    html = RenderViaRegistry(handler, "docx",
-                        new OfficeCli.Core.Rendering.RenderOptions { PageFilter = pageFilter });
-                else if (handler is OfficeCli.Core.Plugins.FormatHandlerProxy proxy)
-                    html = proxy.ViewAsHtml(int.TryParse(pageFilter, out var p) ? p : (int?)null);
-
-                if (html != null)
-                {
-                    if (outArg != null || browser)
-                    {
-                        // --out: write to the requested path. --browser without --out:
-                        // write to a temp file and open it. With both, write to --out
-                        // and open that.
-                        // SECURITY: when falling back to a temp file, include a random
-                        // token so the preview path is not predictable. A predictable
-                        // path (HHmmss only) lets a local attacker pre-place a symlink at
-                        // the expected location, causing File.WriteAllText to follow it
-                        // and overwrite an arbitrary victim file with preview HTML. It
-                        // also caused collisions between concurrent `view html`
-                        // invocations of the same file.
-                        var htmlPath = outArg ?? Path.Combine(Path.GetTempPath(), $"officecli_preview_{Path.GetFileNameWithoutExtension(file.Name)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.html");
-                        File.WriteAllText(htmlPath, html);
-                        Console.WriteLine(Path.GetFullPath(htmlPath));
-                        if (browser)
-                        {
-                            try
-                            {
-                                var psi = new System.Diagnostics.ProcessStartInfo(htmlPath) { UseShellExecute = true };
-                                System.Diagnostics.Process.Start(psi);
-                            }
-                            catch { /* silently ignore if browser can't be opened */ }
-                        }
-                    }
-                    else
-                    {
-                        // Default: output HTML to stdout
-                        Console.Write(html);
-                    }
-                }
-                else
-                {
-                    throw new OfficeCli.Core.CliException("HTML preview is only supported for .pptx, .xlsx, and .docx files.")
-                    {
-                        Code = "unsupported_type",
-                        Suggestion = "Use a .pptx, .xlsx, or .docx file, or use mode 'text' or 'annotated' for other formats.",
-                        ValidValues = ["text", "annotated", "outline", "stats", "issues"]
-                    };
-                }
-                return 0;
-            }
-
-            if (mode.ToLowerInvariant() is "screenshot" or "p")
-            {
-                // Screenshot mode: render the same HTML preview as `view html`, then
-                // headless-screenshot the temp HTML to a PNG. Mirrors svg's pattern of
-                // a dedicated mode that produces a file + prints the path.
-                // --grid N tiles slides into an N-column thumbnail grid (pptx only).
-                //
-                // CONSISTENCY(screenshot-default-first-page): screenshot mode defaults
-                // to a single bounded visual unit (pptx → slide 1, docx → page 1, xlsx
-                // → active sheet). Without this, multi-slide/multi-page docs render
-                // the full HTML stacked vertically and get silently cropped by the
-                // viewport height (default 1200) — a footgun. To capture all
-                // slides/pages, use --page explicitly (e.g. --page 1-N) or --grid N
-                // for pptx thumbnails. xlsx is naturally first-sheet via CSS
-                // `.sheet-content { display:none }` + `.active` on sheet 0.
-                string? html = null;
-                byte[]? directPng = null;
-                // --clip captures a data-path-addressed region out of the HTML
-                // preview, so the native/direct-PNG backends (whole pages only)
-                // are bypassed. pptx: the clip's slide ordinal selects the page
-                // when --page wasn't given; docx: all pages render so the target
-                // can sit anywhere (--page still narrows explicitly).
-                if (clipArg != null)
-                    renderMode = "html";
-                if (handler is OfficeCli.Handlers.PowerPointHandler pptHandler)
-                {
-                    var effectiveFilter = pageFilter;
-                    if (clipArg != null && string.IsNullOrEmpty(effectiveFilter)
-                        && System.Text.RegularExpressions.Regex.Match(clipArg, @"^/slide\[(\d+)\]") is { Success: true } slideM)
-                        effectiveFilter = slideM.Groups[1].Value;
-                    if (string.IsNullOrEmpty(effectiveFilter) && start is null && end is null && gridCols == 0)
-                        effectiveFilter = "1";
-                    var (pStart, pEnd) = ParsePptHtmlPage(effectiveFilter, start, end, pptHandler);
-
-                    // Native path (mirrors docx --render auto/native/html): on Windows
-                    // with the presentation app installed, export the slide(s) to PNG
-                    // with the OS-native engine. Grid mode is HTML-only, so native is
-                    // skipped when --grid is set. The slide's 96-DPI native pixels are
-                    // the default export size; a custom --screenshot-width overrides it
-                    // (aspect-matched height). A range stacks vertically.
-                    var (nativeW, nativeH) = pptHandler.GetSlideNativePixels();
-                    // -1 = auto: pick columns from the slide count + slide aspect so the
-                    // composed contact sheet is ≈ square (landscape slides → fewer cols).
-                    int gridColsResolved = gridCols < 0
-                        ? OfficeCli.Core.HtmlScreenshot.AutoGridColumns((pEnd ?? pptHandler.GetSlideCount()) - (pStart ?? 1) + 1, nativeW, nativeH)
-                        : gridCols;
-                    int exportW = nativeW, exportH = nativeH;
-                    if (!(screenshotWidth == 1600 && screenshotHeight == 1200))
-                    {
-                        exportW = screenshotWidth;
-                        exportH = screenshotHeight == 1200
-                            ? Math.Max(1, (int)Math.Round(screenshotWidth * (double)nativeH / nativeW))
-                            : screenshotHeight;
-                    }
-                    if (renderMode != "html" && OperatingSystem.IsWindows())
-                    {
-                        try
-                        {
-                            if (gridColsResolved > 0)
-                            {
-                                const int gap = 12, pad = 12;
-                                int cellW = Math.Max(1, (int)Math.Round((screenshotWidth - 2 * pad - (gridColsResolved - 1) * gap) / (double)gridColsResolved));
-                                int cellH = Math.Max(1, (int)Math.Round(cellW * (double)nativeH / nativeW));
-                                directPng = OfficeCli.Core.PowerPointPngBackend.RenderGrid(file.FullName, pStart ?? 1, pEnd ?? pptHandler.GetSlideCount(), cellW, cellH, gridColsResolved, gap, pad);
-                            }
-                            else
-                            {
-                                directPng = OfficeCli.Core.PowerPointPngBackend.Render(file.FullName, pStart ?? 1, pEnd ?? pStart ?? 1, exportW, exportH);
-                            }
-                        }
-                        catch { directPng = null; }
-                    }
-                    if (renderMode == "native" && directPng == null)
-                        throw new OfficeCli.Core.CliException("--render native requires Windows with Microsoft PowerPoint installed.")
-                        { Code = "native_unavailable", Suggestion = "Use --render html or --render auto." };
-
-                    if (directPng == null)
-                    {
-                        html = RenderViaRegistry(pptHandler, "pptx", new OfficeCli.Core.Rendering.RenderOptions
-                        { StartPage = pStart, EndPage = pEnd, GridColumns = gridColsResolved, ViewportPx = screenshotWidth })!;
-
-                        // The generic 4:3 viewport (1600×1200) letterboxes a single slide with
-                        // canvas padding. When capturing one slide (not a multi-slide range or
-                        // grid), size the viewport to the slide so the PNG is the slide,
-                        // padding-free (ViewAsHtml scales the slide to fill + zeroes the headless
-                        // page padding). Default dims -> the slide's 96-DPI native pixels;
-                        // a custom --screenshot-width -> that width with an aspect-matched height.
-                        // Multi-slide ranges stack vertically and keep the tall viewport.
-                        if (pStart == pEnd && gridCols == 0)
-                        {
-                            if (screenshotWidth == 1600 && screenshotHeight == 1200)
-                                (screenshotWidth, screenshotHeight) = (nativeW, nativeH);
-                            else if (screenshotHeight == 1200)
-                                screenshotHeight = Math.Max(1, (int)Math.Round(screenshotWidth * (double)nativeH / nativeW));
-                        }
-                    }
-                }
-                else if (handler is OfficeCli.Handlers.ExcelHandler excelHandler)
-                    html = RenderViaRegistry(excelHandler, "xlsx", new OfficeCli.Core.Rendering.RenderOptions())!;
-                else if (handler is OfficeCli.Handlers.WordHandler wordHandlerGrid && gridCols != 0)
-                {
-                    // Contact-sheet grid: tile every page into an N-column (or auto)
-                    // thumbnail grid for a one-shot whole-document overview.
-                    // Native-first, mirroring pptx and single-page docx: on Windows
-                    // with Word, RenderGrid rasterizes each real-Word page and tiles
-                    // it; elsewhere (or on failure) we fall back to the HTML preview
-                    // grid. Column count + cell size are computed once below and used
-                    // by both paths.
-                    const int gap = 12, pad = 12;
-                    const int maxDim = 1920; // mirror HtmlScreenshot.CapDim's LLM-image ceiling
-                    const int scrollbar = 17;
-                    var (npW, npH) = wordHandlerGrid.GetPageNativePixels();
-
-                    // Page count needs a real layout pass; the preview's paginator
-                    // publishes it via <title>PAGES:N> on dump-dom (independent of the
-                    // grid, which only reflows AFTER pagination). Count first so
-                    // `--grid auto` can size the column count to the document.
-                    int pageCount = 1;
-                    var tmpForCount = Path.Combine(Path.GetTempPath(), $"officecli_gridcount_{Path.GetFileNameWithoutExtension(file.Name)}_{Guid.NewGuid():N}.html");
-                    try
-                    {
-                        File.WriteAllText(tmpForCount, RenderViaRegistry(wordHandlerGrid, "docx", new OfficeCli.Core.Rendering.RenderOptions())!);
-                        pageCount = OfficeCli.Core.HtmlScreenshot.GetPageCountFromDom(tmpForCount) ?? 1;
-                    }
-                    catch { /* fall back to 1 row */ }
-                    finally { try { File.Delete(tmpForCount); } catch { /* ignore */ } }
-
-                    // -1 = auto: pick columns that keep the composed sheet ≈ square.
-                    int docGridCols = gridCols < 0 ? OfficeCli.Core.HtmlScreenshot.AutoGridColumns(pageCount, npW, npH) : gridCols;
-                    int rows = Math.Max(1, (pageCount + docGridCols - 1) / docGridCols);
-
-                    // Pre-cap to the 1920 ceiling OURSELVES and recompute cellW from the
-                    // final width, so cellW and the capture viewport stay consistent
-                    // (CapDim shrinking the viewport while cellW stayed fixed is what
-                    // collapsed a 3-col request to 2 cols). After this, CapDim is a no-op.
-                    // Subtract a scrollbar allowance so this matches layoutGrid's
-                    // clientWidth-derived cell size → the row-height estimate (and thus
-                    // the captured viewport) tracks the real grid with little slack.
-                    double vpW = screenshotWidth;
-                    double cellW = Math.Max(1.0, (vpW - scrollbar - 2.0 * pad - (docGridCols - 1) * gap) / docGridCols);
-                    double cellH = cellW * npH / npW;
-                    double vpH = pad * 2 + rows * cellH + (rows - 1) * gap;
-                    double over = Math.Max(vpW, vpH) / maxDim;
-                    if (over > 1.0) { vpW /= over; cellW /= over; cellH /= over; vpH /= over; }
-
-                    // Native-first: render each real-Word page and tile (Windows + Word).
-                    if (renderMode != "html" && OperatingSystem.IsWindows())
-                    {
-                        try { directPng = OfficeCli.Core.WordPdfBackend.RenderGrid(file.FullName, $"1-{pageCount}", (int)Math.Round(cellW), (int)Math.Round(cellH), docGridCols, gap, pad); }
-                        catch { directPng = null; }
-                    }
-                    if (renderMode == "native" && directPng == null)
-                        throw new OfficeCli.Core.CliException("--render native requires Windows with Microsoft Word installed.")
-                        { Code = "native_unavailable", Suggestion = "Use --render html or --render auto." };
-                    if (directPng == null)
-                    {
-                        // HTML fallback: layoutGrid tiles in-browser; size the viewport
-                        // to fit the rows so window-size backends don't crop.
-                        html = RenderViaRegistry(wordHandlerGrid, "docx", new OfficeCli.Core.Rendering.RenderOptions
-                        { GridColumns = docGridCols, GridCellWidthPx = (int)Math.Round(cellW) })!;
-                        screenshotWidth = Math.Max(1, (int)Math.Round(vpW));
-                        screenshotHeight = Math.Max(1, (int)Math.Ceiling(vpH));
-                    }
-                }
-                else if (handler is OfficeCli.Handlers.WordHandler wordHandler)
-                {
-                    // --clip: render every page (filter stays null) unless the
-                    // caller narrowed with --page — the target may be anywhere.
-                    var effectiveFilter = clipArg != null
-                        ? pageFilter
-                        : (string.IsNullOrEmpty(pageFilter) ? "1" : pageFilter);
-                    if (renderMode != "html" && OperatingSystem.IsWindows())
-                    {
-                        // effectiveFilter is only null under --range, which forces
-                        // renderMode=html — this native branch is then unreachable.
-                        try { directPng = OfficeCli.Core.WordPdfBackend.Render(file.FullName, effectiveFilter!); }
-                        catch { directPng = null; }
-                    }
-                    if (renderMode == "native" && directPng == null)
-                        throw new OfficeCli.Core.CliException("--render native requires Windows with Microsoft Word installed.")
-                        { Code = "native_unavailable", Suggestion = "Use --render html or --render auto." };
-                    if (directPng == null)
-                    {
-                        html = RenderViaRegistry(wordHandler, "docx",
-                            new OfficeCli.Core.Rendering.RenderOptions { PageFilter = effectiveFilter })!;
-
-                        // HTML-path screenshot of a single page: size the viewport to the
-                        // page's 96-DPI native pixels so the PNG is the page, padding-free
-                        // (the preview scales the page to fill + drops its chrome when
-                        // headless). Default dims -> native px; a custom --screenshot-width
-                        // -> that width with an aspect-matched height. The Windows COM path
-                        // (directPng != null) renders real pages and is untouched.
-                        if (int.TryParse(effectiveFilter, out _) && gridCols == 0)
-                        {
-                            var (nativeW, nativeH) = wordHandler.GetPageNativePixels();
-                            if (screenshotWidth == 1600 && screenshotHeight == 1200)
-                                (screenshotWidth, screenshotHeight) = (nativeW, nativeH);
-                            else if (screenshotHeight == 1200)
-                                screenshotHeight = Math.Max(1, (int)Math.Round(screenshotWidth * (double)nativeH / nativeW));
-                        }
-                    }
-                }
-
-                // A renderer that paints its own pixels supplies them directly, sitting
-                // between the native backend (which wins when it ran) and the HTML→headless
-                // fallback. An explicit --render html opts out. The default install has no
-                // PNG-capable renderer, so this is a no-op there.
-                if (directPng == null && renderMode != "html")
-                {
-                    var pngFmt = handler switch
-                    {
-                        OfficeCli.Handlers.PowerPointHandler => "pptx",
-                        OfficeCli.Handlers.ExcelHandler => "xlsx",
-                        OfficeCli.Handlers.WordHandler => "docx",
-                        _ => null
-                    };
-                    if (pngFmt != null)
-                        directPng = RenderPngBytesViaRegistry(handler, pngFmt,
-                            new OfficeCli.Core.Rendering.RenderOptions
-                            {
-                                Output = OfficeCli.Core.Rendering.RenderOutputKind.Png,
-                                PageFilter = pageFilter,
-                                RasterWidthPx = screenshotWidth,
-                                RasterHeightPx = screenshotHeight,
-                            });
-                }
-
-                if (html == null && directPng == null)
-                {
-                    throw new OfficeCli.Core.CliException("Screenshot mode is only supported for .pptx, .xlsx, and .docx files.")
-                    {
-                        Code = "unsupported_type",
-                        Suggestion = "Use a .pptx, .xlsx, or .docx file.",
-                        ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot"]
-                    };
-                }
-
-                var pngPath = outArg ?? Path.Combine(Path.GetTempPath(), $"officecli_screenshot_{Path.GetFileNameWithoutExtension(file.Name)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.png");
-                if (directPng != null)
-                {
-                    File.WriteAllBytes(pngPath, directPng);
-                }
-                else
-                {
-                    // SECURITY: random token in temp filename — same rationale as the html/--browser path.
-                    var tmpHtml = Path.Combine(Path.GetTempPath(), $"officecli_preview_{Path.GetFileNameWithoutExtension(file.Name)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.html");
-                    File.WriteAllText(tmpHtml, html!);
-                    var r = clipArg != null
-                        ? OfficeCli.Core.HtmlScreenshot.CaptureClipped(tmpHtml, pngPath,
-                            OfficeCli.Core.HtmlScreenshot.ResolveClipDataPaths(clipArg))
-                        : OfficeCli.Core.HtmlScreenshot.Capture(tmpHtml, pngPath, screenshotWidth, screenshotHeight);
-                    try { File.Delete(tmpHtml); } catch { /* ignore */ }
-                    if (!r.Ok && r.Error == "clip_target_not_found")
-                    {
-                        throw new OfficeCli.Core.CliException(
-                            $"--range target '{clipArg}' matched no rendered element.")
-                        {
-                            Code = "range_target_not_found",
-                            Suggestion = "Use a data-path the HTML preview emits (xlsx: 'Sheet1!A1:C3' within the sheet's used area; pptx: '/slide[N]/shape[K]'; docx: '/body/table[N]' or '/body/p[N]'). `query` lists element paths.",
-                        };
-                    }
-                    if (!r.Ok)
-                    {
-                        throw new OfficeCli.Core.CliException(
-                            "No headless browser available. Install Chrome/Edge/Chromium or Firefox, or `pip install playwright && playwright install chromium`."
-                            + (r.Error != null ? $" Last error: {r.Error}" : ""))
-                        { Code = "no_screenshot_backend" };
-                    }
-                }
-                Console.WriteLine(Path.GetFullPath(pngPath));
-                if (handler is OfficeCli.Handlers.PowerPointHandler pptCount)
-                    Console.Error.WriteLine($"[pages] total={pptCount.GetSlideCount()}");
-                if (browser)
-                {
-                    try
-                    {
-                        var psi = new System.Diagnostics.ProcessStartInfo(pngPath) { UseShellExecute = true };
-                        System.Diagnostics.Process.Start(psi);
-                    }
-                    catch { /* silently ignore if image viewer can't be opened */ }
-                }
-                return 0;
-            }
-
-            if (mode.ToLowerInvariant() is "svg" or "g")
-            {
-                if (handler is OfficeCli.Handlers.PowerPointHandler pptSvgHandler)
-                {
-                    // CONSISTENCY(view-page): SVG mode honors --page like html mode; --page wins over --start
-                    int slideNum = 1;
-                    if (!string.IsNullOrEmpty(pageFilter))
-                    {
-                        var firstTok = pageFilter.Split(',')[0].Split('-')[0].Trim();
-                        // CONSISTENCY(strict-page): reject non-positive --page
-                        // values explicitly instead of silently rendering
-                        // slide 1, mirroring how 0 / negatives are surfaced
-                        // elsewhere in the CLI.
-                        if (!int.TryParse(firstTok, out var p))
-                            throw new ArgumentException(
-                                $"Invalid --page value '{pageFilter}': expected a positive slide number.");
-                        if (p <= 0)
-                            throw new ArgumentException(
-                                $"Invalid --page value '{pageFilter}': slide number must be >= 1.");
-                        slideNum = p;
-                    }
-                    else if (start.HasValue && start.Value > 0)
-                    {
-                        slideNum = start.Value;
-                    }
-                    var svg = RenderViaRegistry(handler, "pptx",
-                        new OfficeCli.Core.Rendering.RenderOptions
-                        { Output = OfficeCli.Core.Rendering.RenderOutputKind.Svg, StartPage = slideNum })!;
-
-                    if (browser)
-                    {
-                        string outPath;
-                        if (svg.Contains("data-formula"))
-                        {
-                            // Wrap SVG in HTML shell for KaTeX formula rendering
-                            // GUID keeps the path unpredictable so a local attacker
-                            // can't pre-plant a symlink at it and have WriteAllText
-                            // clobber a victim file (CWE-59) — matches the sibling
-                            // preview/screenshot temp writers in this file.
-                            outPath = Path.Combine(Path.GetTempPath(), $"officecli_slide{slideNum}_{Path.GetFileNameWithoutExtension(file.Name)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.html");
-                            // CONSISTENCY(katex-mirror): mirror-first with CDN fallback — see Core/KatexAssets.
-                            var html = $"<!DOCTYPE html><html><head><meta charset='UTF-8'><link rel='stylesheet' href='{OfficeCli.Core.KatexAssets.CssUrl}' onerror=\"{OfficeCli.Core.KatexAssets.CssOnErrorJs}\"><script defer src='{OfficeCli.Core.KatexAssets.JsUrl}' onerror=\"{OfficeCli.Core.KatexAssets.JsOnErrorJs("")}\"></script><style>body{{margin:0;display:flex;justify-content:center;background:#f0f0f0}}</style></head><body>{svg}<script>window.addEventListener('load',function(){{document.querySelectorAll('[data-formula]').forEach(function(el){{try{{katex.render(el.getAttribute('data-formula'),el,{{throwOnError:false,displayMode:true}})}}catch(e){{}}}})}})</script></body></html>";
-                            File.WriteAllText(outPath, html);
-                        }
-                        else
-                        {
-                            outPath = Path.Combine(Path.GetTempPath(), $"officecli_slide{slideNum}_{Path.GetFileNameWithoutExtension(file.Name)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.svg");
-                            File.WriteAllText(outPath, svg);
-                        }
-                        Console.WriteLine(outPath);
-                        try
-                        {
-                            var psi = new System.Diagnostics.ProcessStartInfo(outPath) { UseShellExecute = true };
-                            System.Diagnostics.Process.Start(psi);
-                        }
-                        catch { /* silently ignore if browser can't be opened */ }
-                    }
-                    else
-                    {
-                        Console.Write(svg);
-                    }
-                }
-                else if (handler is OfficeCli.Core.Plugins.FormatHandlerProxy svgProxy)
-                {
-                    int? svgPage = null;
-                    if (!string.IsNullOrEmpty(pageFilter)
-                        && int.TryParse(pageFilter.Split(',')[0].Split('-')[0].Trim(), out var sp))
-                        svgPage = sp;
-                    var svg = svgProxy.ViewAsSvg(svgPage);
-                    if (svg is null)
-                        throw new OfficeCli.Core.CliException(
-                            $"SVG preview is not supported by the format-handler plugin for {file.Extension}.")
-                        { Code = "unsupported_type" };
-                    if (browser)
-                    {
-                        var outPath = Path.Combine(Path.GetTempPath(),
-                            $"officecli_preview_{Path.GetFileNameWithoutExtension(file.Name)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.svg");
-                        File.WriteAllText(outPath, svg);
-                        Console.WriteLine(outPath);
-                        try
-                        {
-                            var psi = new System.Diagnostics.ProcessStartInfo(outPath) { UseShellExecute = true };
-                            System.Diagnostics.Process.Start(psi);
-                        }
-                        catch { /* silently ignore if viewer can't be opened */ }
-                    }
-                    else
-                    {
-                        Console.Write(svg);
-                    }
-                }
-                else
-                {
-                    throw new OfficeCli.Core.CliException("SVG preview is only supported for .pptx files.")
-                    {
-                        Code = "unsupported_type",
-                        Suggestion = "Use a .pptx file, or use mode 'text' or 'annotated' for other formats.",
-                        ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot"]
-                    };
-                }
-                return 0;
-            }
-
-            int? withPagesValue = null;
-            if (withPages && (mode.ToLowerInvariant() is "stats" or "s") && handler is OfficeCli.Handlers.WordHandler wordHandlerForCount)
-            {
-                if (OperatingSystem.IsWindows())
-                {
-                    try { withPagesValue = OfficeCli.Core.WordPdfBackend.GetPageCount(file.FullName); } catch { withPagesValue = null; }
-                }
-                if (withPagesValue == null)
-                {
-                    var tmpHtml = Path.Combine(Path.GetTempPath(), $"officecli_pc_{Path.GetFileNameWithoutExtension(file.Name)}_{Guid.NewGuid():N}.html");
-                    try
-                    {
-                        File.WriteAllText(tmpHtml, RenderViaRegistry(wordHandlerForCount, "docx", new OfficeCli.Core.Rendering.RenderOptions())!);
-                        withPagesValue = OfficeCli.Core.HtmlScreenshot.GetPageCountFromDom(tmpHtml);
-                    }
-                    finally { try { File.Delete(tmpHtml); } catch { } }
-                }
-                if (withPagesValue == null)
-                    throw new OfficeCli.Core.CliException("--page-count: failed to get page count (Word backend and HTML fallback both unavailable).")
-                    { Code = "page_count_unavailable" };
-            }
-
-            if (json)
-            {
-                // Structured JSON output — no Content string wrapping
-                var modeKey = mode.ToLowerInvariant();
-                if (modeKey is "stats" or "s")
-                {
-                    var statsJson = handler.ViewAsStatsJson();
-                    if (withPagesValue.HasValue) statsJson["pages"] = withPagesValue.Value;
-                    Console.WriteLine(OutputFormatter.WrapEnvelope(statsJson.ToJsonString(OutputFormatter.PublicJsonOptions)));
-                }
-                else if (modeKey is "outline" or "o")
-                    Console.WriteLine(OutputFormatter.WrapEnvelope(handler.ViewAsOutlineJson().ToJsonString(OutputFormatter.PublicJsonOptions)));
-                else if (modeKey is "text" or "t")
-                    Console.WriteLine(OutputFormatter.WrapEnvelope(handler.ViewAsTextJson(start, end, maxLines, cols, clipArg).ToJsonString(OutputFormatter.PublicJsonOptions)));
-                else if (modeKey is "annotated" or "a")
-                    Console.WriteLine(OutputFormatter.WrapEnvelope(
-                        OutputFormatter.FormatView(mode, handler.ViewAsAnnotated(start, end, maxLines, cols), OutputFormat.Json)));
-                else if (modeKey is "issues" or "i")
-                    Console.WriteLine(OutputFormatter.WrapEnvelope(
-                        OutputFormatter.FormatIssues(handler.ViewAsIssues(issueType, limit), OutputFormat.Json)));
-                else if (modeKey is "forms" or "f")
-                {
-                    if (handler is OfficeCli.Handlers.WordHandler wordFormsHandler)
-                        Console.WriteLine(OutputFormatter.WrapEnvelope(wordFormsHandler.ViewAsFormsJson().ToJsonString(OutputFormatter.PublicJsonOptions)));
-                    else if (handler is OfficeCli.Core.Plugins.FormatHandlerProxy formsProxy)
-                    {
-                        var formsJson = formsProxy.ViewAsFormsJson();
-                        if (formsJson is null)
-                            throw new OfficeCli.Core.CliException($"Forms view is not supported by the format-handler plugin for {file.Extension}.")
-                            { Code = "unsupported_type" };
-                        Console.WriteLine(OutputFormatter.WrapEnvelope(formsJson.ToJsonString(OutputFormatter.PublicJsonOptions)));
-                    }
-                    else
-                        throw new OfficeCli.Core.CliException("Forms view is only supported for .docx files.")
-                        {
-                            Code = "unsupported_type",
-                            ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot", "pdf", "forms"]
-                        };
-                }
-                else
-                    throw new OfficeCli.Core.CliException($"Unknown mode: {mode}. Available: text, annotated, outline, stats, issues, html, svg, screenshot, forms")
-                    {
-                        Code = "invalid_value",
-                        ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot", "pdf", "forms"]
-                    };
-            }
-            else
-            {
-                var output = mode.ToLowerInvariant() switch
-                {
-                    "text" or "t" => handler.ViewAsText(start, end, maxLines, cols, clipArg),
-                    "annotated" or "a" => handler.ViewAsAnnotated(start, end, maxLines, cols),
-                    "outline" or "o" => handler.ViewAsOutline(),
-                    "stats" or "s" => withPagesValue.HasValue
-                        ? $"Pages: {withPagesValue}\n" + handler.ViewAsStats()
-                        : handler.ViewAsStats(),
-                    "issues" or "i" => OutputFormatter.FormatIssues(handler.ViewAsIssues(issueType, limit), OutputFormat.Text),
-                    "forms" or "f" => handler switch
-                    {
-                        OfficeCli.Handlers.WordHandler wfh => wfh.ViewAsForms(),
-                        OfficeCli.Core.Plugins.FormatHandlerProxy fp
-                            => fp.ViewAsFormsJson()?.ToJsonString(OutputFormatter.PublicJsonOptions)
-                               ?? throw new OfficeCli.Core.CliException($"Forms view is not supported by the format-handler plugin for {file.Extension}.")
-                                   { Code = "unsupported_type" },
-                        _ => throw new OfficeCli.Core.CliException("Forms view is only supported for .docx files.")
-                        {
-                            Code = "unsupported_type",
-                            ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot", "pdf", "forms"]
-                        }
-                    },
-                    _ => throw new OfficeCli.Core.CliException($"Unknown mode: {mode}. Available: text, annotated, outline, stats, issues, html, svg, screenshot, forms")
-                    {
-                        Code = "invalid_value",
-                        ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot", "pdf", "forms"]
-                    }
-                };
-                Console.WriteLine(output);
-            }
-            return 0;
+            return RunView(handler, file.FullName, new ViewArgs(mode, start, end, maxLines, issueType, limit, colsStr,
+                pageFilter, browser, outArg, clipArg, screenshotWidth, screenshotHeight, gridCols, renderMode, withPages, json), null);
         }, json); });
 
         return viewCommand;
@@ -713,7 +159,8 @@ static partial class CommandBuilder
         if (string.IsNullOrWhiteSpace(spec)) return 0;
         spec = spec.Trim();
         if (spec.Equals("auto", StringComparison.OrdinalIgnoreCase)) return -1;
-        if (int.TryParse(spec, out var n) && n >= 0) return n;
+        // 0 is not a column count (it used to be accepted and silently turn the grid off).
+        if (int.TryParse(spec, out var n) && n >= 1) return n;
         throw new OfficeCli.Core.CliException($"Invalid --grid value: {spec}. Use a column count (e.g. 3) or 'auto'.")
         { Code = "invalid_value", ValidValues = ["auto", "1", "2", "3", "4"] };
     }
@@ -751,31 +198,231 @@ static partial class CommandBuilder
             new OfficeCli.Handlers.Rendering.HandlerRenderInput(handler, formatId), options).Bytes;
     }
 
+    // ---- Screenshot viewport sizing shared by the standalone and resident paths ----
+    // ResidentServer.cs mirrors the screenshot branches of this file; the sizing
+    // maths live here once so the two paths cannot drift apart again (issue #485).
+
+    /// <summary>
+    /// Size the HTML-screenshot viewport for a pptx capture and return the grid
+    /// column count the preview should tile with (0 = plain stack).
+    /// A multi-slide range without --grid is a one-column contact sheet; a grid
+    /// mirrors the preview CSS (24px total padding, 12px gap) and the 1920px
+    /// capture ceiling so the PNG is exactly the sheet. A single slide at the
+    /// default dims gets the slide's 96-DPI native pixels, padding-free.
+    /// </summary>
+    internal static int PptHtmlScreenshotViewport(int gridCols, int gridColsResolved, int? pStart, int? pEnd,
+        int slideCount, int nativeW, int nativeH, ref int screenshotWidth, ref int screenshotHeight)
+    {
+        int htmlGridCols = gridColsResolved > 0 ? gridColsResolved
+            : (pStart.HasValue && pEnd.HasValue && pStart.Value != pEnd.Value ? 1 : 0);
+        if (htmlGridCols > 0)
+        {
+            const int pad = 24, gap = 12, maxDim = 1920;
+            int count = (pEnd ?? slideCount) - (pStart ?? 1) + 1;
+            int rows = Math.Max(1, (count + htmlGridCols - 1) / htmlGridCols);
+            double vpW = screenshotWidth == 1600 && screenshotHeight == 1200 && htmlGridCols == 1
+                ? nativeW + pad : screenshotWidth;
+            double cellW = Math.Max(1.0, (vpW - pad - (htmlGridCols - 1) * gap) / htmlGridCols);
+            double cellH = cellW * nativeH / nativeW;
+            double vpH = pad + rows * cellH + (rows - 1) * gap;
+            double over = Math.Max(vpW, vpH) / maxDim;
+            if (over > 1.0) { vpW /= over; vpH /= over; }
+            screenshotWidth = Math.Max(1, (int)Math.Round(vpW));
+            screenshotHeight = Math.Max(1, (int)Math.Ceiling(vpH));
+        }
+        else if (pStart == pEnd && gridCols == 0)
+        {
+            if (screenshotWidth == 1600 && screenshotHeight == 1200)
+                (screenshotWidth, screenshotHeight) = (nativeW, nativeH);
+            else if (screenshotHeight == 1200)
+                screenshotHeight = Math.Max(1, (int)Math.Round(screenshotWidth * (double)nativeH / nativeW));
+        }
+        return htmlGridCols;
+    }
+
+    internal const int DocxSheetGap = 12, DocxSheetPad = 12;
+
+    /// <summary>Does a docx screenshot request take the contact-sheet path?</summary>
+    internal static bool DocxWantsSheet(int gridCols, string? pageFilter)
+        => gridCols != 0 || IsMultiPageFilter(pageFilter);
+
+    internal sealed record DocxSheet(int Cols, int CellWpx, int CellHpx, int ViewportW, int ViewportH,
+        string NativePageSpec, OfficeCli.Core.Rendering.RenderOptions HtmlOptions);
+
+    /// <summary>
+    /// Column count, cell size, viewport and page selection for a docx contact
+    /// sheet. The page count needs a real layout pass (the preview publishes it
+    /// via &lt;title&gt;PAGES:N&gt;). The sheet is pre-capped to the 1920px
+    /// ceiling so cell size and viewport stay consistent; a one-column sheet at
+    /// the default dims keeps the page's native width before the cap.
+    /// </summary>
+    internal static DocxSheet DocxSheetLayout(OfficeCli.Handlers.WordHandler wordHandler, string? pageFilter, int gridCols,
+        int screenshotWidth, int screenshotHeight)
+    {
+        const int gap = DocxSheetGap, pad = DocxSheetPad, maxDim = 1920, scrollbar = 17;
+        var (npW, npH) = wordHandler.GetPageNativePixels();
+
+        int pageCount = DocxPreviewPageCount(wordHandler) ?? 1;
+
+        // Pages actually tiled: the --page selection clamped to the document,
+        // or every page when no filter was given. A selection that starts past
+        // the last page is an error, not an empty sheet.
+        ValidateDocxPageSpec(pageFilter);
+        var selectedPages = ParseDocxPageSelection(pageFilter, pageCount);
+        if (!string.IsNullOrWhiteSpace(pageFilter)
+            && (selectedPages.Count == 0 || ParseDocxPageSelection(pageFilter, int.MaxValue).Count != selectedPages.Count))
+            throw new OfficeCli.Core.CliException($"--page {pageFilter} out of range (total pages: {pageCount}).") { Code = "out_of_range" };
+        int tiled = selectedPages.Count > 0 ? selectedPages.Count : pageCount;
+        string nativePageSpec = selectedPages.Count > 0 ? string.Join(",", selectedPages) : $"1-{pageCount}";
+
+        // -1 = auto: columns that keep the sheet ≈ square; 0 (range without --grid) = one column.
+        int cols = gridCols < 0 ? OfficeCli.Core.HtmlScreenshot.AutoGridColumns(tiled, npW, npH)
+            : gridCols == 0 ? 1 : gridCols;
+        int rows = Math.Max(1, (tiled + cols - 1) / cols);
+
+        double vpW = screenshotWidth == 1600 && screenshotHeight == 1200 && cols == 1
+            ? npW + scrollbar + 2.0 * pad : screenshotWidth;
+        double cellW = Math.Max(1.0, (vpW - scrollbar - 2.0 * pad - (cols - 1) * gap) / cols);
+        double cellH = cellW * npH / npW;
+        double vpH = pad * 2 + rows * cellH + (rows - 1) * gap;
+        double over = Math.Max(vpW, vpH) / maxDim;
+        if (over > 1.0) { vpW /= over; cellW /= over; cellH /= over; vpH /= over; }
+
+        var html = new OfficeCli.Core.Rendering.RenderOptions
+        { PageFilter = selectedPages.Count > 0 ? pageFilter : null, GridColumns = cols, GridCellWidthPx = (int)Math.Round(cellW) };
+        return new DocxSheet(cols, (int)Math.Round(cellW), (int)Math.Round(cellH),
+            Math.Max(1, (int)Math.Round(vpW)), Math.Max(1, (int)Math.Ceiling(vpH)), nativePageSpec, html);
+    }
+
+    /// <summary>
+    /// Single docx page through the HTML path: size the viewport to the page's
+    /// 96-DPI native pixels (default dims) or aspect-match a custom width.
+    /// </summary>
+    internal static void DocxSinglePageViewport(OfficeCli.Handlers.WordHandler wordHandler, string? effectiveFilter, int gridCols,
+        ref int screenshotWidth, ref int screenshotHeight)
+    {
+        if (!int.TryParse(effectiveFilter, out _) || gridCols != 0) return;
+        var (nativeW, nativeH) = wordHandler.GetPageNativePixels();
+        if (screenshotWidth == 1600 && screenshotHeight == 1200)
+            (screenshotWidth, screenshotHeight) = (nativeW, nativeH);
+        else if (screenshotHeight == 1200)
+            screenshotHeight = Math.Max(1, (int)Math.Round(screenshotWidth * (double)nativeH / nativeW));
+    }
+
+    /// <summary>True when a --page filter names more than one page (a range or a list).</summary>
+    internal static bool IsMultiPageFilter(string? pageFilter)
+    {
+        if (string.IsNullOrWhiteSpace(pageFilter)) return false;
+        var pages = ParseDocxPageSelection(pageFilter, int.MaxValue);
+        return pages.Count > 1;
+    }
+
+    /// <summary>
+    /// Reject a malformed docx --page spec up front (non-numeric, zero or
+    /// negative pages, a range whose end precedes its start) instead of
+    /// rendering every page or a blank page with exit 0.
+    /// </summary>
+    internal static void ValidateDocxPageSpec(string? pageFilter)
+    {
+        if (string.IsNullOrWhiteSpace(pageFilter)) return;
+        foreach (var part in pageFilter.Split(','))
+        {
+            var t = part.Trim();
+            if (t.Length == 0)
+                throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': empty list item.") { Code = "invalid_value" };
+            if (t.Contains('-'))
+            {
+                var r = t.Split('-', 2);
+                if (!int.TryParse(r[0].Trim(), out var from) || !int.TryParse(r[1].Trim(), out var to))
+                    throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': expected N, M-N or a comma list.") { Code = "invalid_value" };
+                if (from <= 0 || to <= 0)
+                    throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': page number must be >= 1.") { Code = "invalid_value" };
+                if (to < from)
+                    throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': range end is before its start.") { Code = "invalid_value", Suggestion = $"Use --page {to}-{from}." };
+            }
+            else if (!int.TryParse(t, out var n))
+                throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': expected a positive page number.") { Code = "invalid_value" };
+            else if (n <= 0)
+                throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': page number must be >= 1.") { Code = "invalid_value" };
+        }
+    }
+
+    /// <summary>
+    /// Page count of a docx as the HTML preview paginates it (a real layout
+    /// pass; the preview publishes the count via &lt;title&gt;PAGES:N&gt;).
+    /// Null when the count could not be read.
+    /// </summary>
+    internal static int? DocxPreviewPageCount(OfficeCli.Handlers.WordHandler wordHandler)
+    {
+        var tmp = Path.Combine(Path.GetTempPath(), $"officecli_gridcount_{Guid.NewGuid():N}.html");
+        try
+        {
+            File.WriteAllText(tmp, RenderViaRegistry(wordHandler, "docx", new OfficeCli.Core.Rendering.RenderOptions())!);
+            return OfficeCli.Core.HtmlScreenshot.GetPageCountFromDom(tmp);
+        }
+        catch { return null; }
+        finally { try { File.Delete(tmp); } catch { /* ignore */ } }
+    }
+
+    /// <summary>
+    /// Expand a docx --page filter ("1", "2-5", "1,3,5", "2-4,7") into the
+    /// sorted distinct pages within 1..total. Unparsable parts are ignored,
+    /// matching the preview's own lenient filter.
+    /// </summary>
+    internal static List<int> ParseDocxPageSelection(string? pageFilter, int total)
+    {
+        var pages = new SortedSet<int>();
+        if (string.IsNullOrWhiteSpace(pageFilter)) return new List<int>();
+        foreach (var part in pageFilter.Split(','))
+        {
+            var t = part.Trim();
+            if (t.Contains('-'))
+            {
+                var r = t.Split('-', 2);
+                if (int.TryParse(r[0].Trim(), out var from) && int.TryParse(r[1].Trim(), out var to))
+                {
+                    to = Math.Min(to, total);
+                    for (int p = Math.Max(1, from); p <= to; p++) pages.Add(p);
+                }
+            }
+            else if (int.TryParse(t, out var n) && n >= 1 && n <= total)
+                pages.Add(n);
+        }
+        return pages.ToList();
+    }
+
     private static (int? start, int? end) ParsePptHtmlPage(
         string? pageFilter, int? start, int? end,
         OfficeCli.Handlers.PowerPointHandler pptHandler)
     {
         if (string.IsNullOrEmpty(pageFilter)) return (start, end);
         var slideCount = pptHandler.Query("slide").Count;
-        var firstTok = pageFilter.Split(',')[0].Trim();
+        var spec = pageFilter.Trim();
+        // A comma list cannot be rendered as one contiguous slide run; refuse
+        // it instead of silently showing only the first item.
+        if (spec.Contains(','))
+            throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': pptx takes a single slide (N) or a contiguous range (M-N), not a list.")
+            { Code = "invalid_value", Suggestion = "Use --page M-N, or run one command per slide." };
         // Range form "M-N"
-        if (firstTok.Contains('-'))
+        if (spec.Contains('-'))
         {
-            var parts = firstTok.Split('-', 2);
-            if (!int.TryParse(parts[0], out var ps) || !int.TryParse(parts[1], out var pe))
-                throw new ArgumentException($"Invalid --page value '{pageFilter}': expected N or M-N or comma list.");
+            var parts = spec.Split('-', 2);
+            if (!int.TryParse(parts[0].Trim(), out var ps) || !int.TryParse(parts[1].Trim(), out var pe))
+                throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': expected N or M-N.") { Code = "invalid_value" };
             if (ps <= 0 || pe <= 0)
-                throw new ArgumentException($"Invalid --page value '{pageFilter}': slide number must be >= 1.");
-            if (ps > slideCount)
-                throw new ArgumentException($"--page {ps} out of range (total slides: {slideCount}).");
-            return (ps, Math.Min(pe, slideCount));
+                throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': slide number must be >= 1.") { Code = "invalid_value" };
+            if (pe < ps)
+                throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': range end is before its start.") { Code = "invalid_value", Suggestion = $"Use --page {pe}-{ps}." };
+            if (ps > slideCount || pe > slideCount)
+                throw new OfficeCli.Core.CliException($"--page {pageFilter} out of range (total slides: {slideCount}).") { Code = "out_of_range" };
+            return (ps, pe);
         }
-        if (!int.TryParse(firstTok, out var p))
-            throw new ArgumentException($"Invalid --page value '{pageFilter}': expected a positive slide number.");
+        if (!int.TryParse(spec, out var p))
+            throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': expected a positive slide number.") { Code = "invalid_value" };
         if (p <= 0)
-            throw new ArgumentException($"Invalid --page value '{pageFilter}': slide number must be >= 1.");
+            throw new OfficeCli.Core.CliException($"Invalid --page value '{pageFilter}': slide number must be >= 1.") { Code = "invalid_value" };
         if (p > slideCount)
-            throw new ArgumentException($"--page {p} out of range (total slides: {slideCount}).");
+            throw new OfficeCli.Core.CliException($"--page {p} out of range (total slides: {slideCount}).") { Code = "out_of_range" };
         return (p, p);
     }
 }

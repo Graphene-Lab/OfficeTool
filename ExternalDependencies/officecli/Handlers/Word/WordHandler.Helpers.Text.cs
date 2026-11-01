@@ -560,7 +560,7 @@ public partial class WordHandler
     // per call; dump resolves one per bookmarkEnd, so the scan made dump O(N²) on
     // bookmark-dense documents. First-wins on duplicate ids, matching the old
     // FirstOrDefault. Invalidated with the other body caches on any structural
-    // mutation (ClearBodyChildIndex → _bookmarkStartByIdCache = null).
+    // mutation, body-level or nested (ClearNavChildCaches → null).
     private BookmarkStart? FindBookmarkStartById(OpenXmlElement scopeRoot, string id)
     {
         _bookmarkStartByIdCache ??= new();

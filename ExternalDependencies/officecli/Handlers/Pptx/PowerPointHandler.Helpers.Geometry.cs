@@ -328,6 +328,11 @@ public partial class PowerPointHandler
             // OpenXML SDK considers it schema-valid. Remap the supplied name to
             // the canonical handle name expected at this position for the preset.
             name = CanonicalAdjName(preset, idx, name);
+            // Issue #235: after the remap, a name the preset does not declare
+            // (any guide on rect/ellipse, adj3 on a two-handle arrow, …) still
+            // makes real PowerPoint refuse the file. Reject it here, like a
+            // malformed formula, instead of writing a file that validates green.
+            RejectUndeclaredAdjName(preset, entry, name);
             if (supplied.TryAdd(name, fmla)) orderSupplied.Add(name);
             else supplied[name] = fmla;
             idx++;
@@ -335,7 +340,7 @@ public partial class PowerPointHandler
 
         // If this preset has a known multi-guide definition, always emit the
         // full guide set so PowerPoint accepts the authored avLst.
-        if (preset != null && MultiGuidePresetDefaults.TryGetValue(preset.Value, out var defaults))
+        if (preset != null && TryGetMultiGuideDefaults(preset.Value, out var defaults))
         {
             foreach (var (name, defFmla) in defaults)
             {
@@ -373,67 +378,99 @@ public partial class PowerPointHandler
     }
 
     /// <summary>
-    /// Authoritative full adjust-guide set for presets whose ECMA-376
-    /// presetShapeDefinition declares MORE THAN ONE adjust guide. Maps the
-    /// preset to its ordered (guide name → default formula) list. Real
+    /// The full (guide name → default formula) set of a preset whose ECMA-376
+    /// presetShapeDefinition declares MORE THAN ONE adjust guide. Real
     /// PowerPoint rejects (0x80070570) an avLst that contains a subset of a
     /// multi-guide preset's guides, so when the user authors an `adj=...` on
     /// any of these we must emit the complete set, filling unspecified guides
-    /// with these defaults. Formulas use the ECMA-376 default values; the
-    /// star adjust handles are the literal `<a:gd … fmla="val N"/>` defaults
-    /// from the spec's presetShapeDefinitions. Single-guide presets are
-    /// deliberately ABSENT — they round-trip fine as a lone `adj`.
+    /// with these defaults. Single-guide presets return false — they
+    /// round-trip fine as a lone `adj`.
     /// </summary>
-    private static readonly IReadOnlyDictionary<Drawing.ShapeTypeValues, (string Name, string Fmla)[]>
-        MultiGuidePresetDefaults = new Dictionary<Drawing.ShapeTypeValues, (string, string)[]>
+    private static bool TryGetMultiGuideDefaults(Drawing.ShapeTypeValues preset, out (string Name, string Fmla)[] guides)
+    {
+        if (PresetAdjustGuides.TryGetValue(PresetName(preset), out var all) && all.Length > 1)
         {
-            [Drawing.ShapeTypeValues.Hexagon] = new[]
-            {
-                ("adj", "val 25000"),
-                ("vf", "val 115470"),
-            },
-            [Drawing.ShapeTypeValues.Star5] = new[]
-            {
-                ("adj", "val 19098"),
-                ("hf", "val 105146"),
-                ("vf", "val 110557"),
-            },
-            [Drawing.ShapeTypeValues.Star6] = new[]
-            {
-                ("adj", "val 28868"),
-                ("hf", "val 115470"),
-            },
-            [Drawing.ShapeTypeValues.Star7] = new[]
-            {
-                ("adj", "val 34601"),
-                ("hf", "val 102572"),
-                ("vf", "val 105210"),
-            },
-            [Drawing.ShapeTypeValues.Star10] = new[]
-            {
-                ("adj", "val 42533"),
-                ("hf", "val 105146"),
-            },
-        };
+            guides = all;
+            return true;
+        }
+        guides = System.Array.Empty<(string, string)>();
+        return false;
+    }
 
     /// <summary>
     /// Map the adjust-handle name at <paramref name="index"/> to the name the
-    /// given <paramref name="preset"/> actually declares. Presets that define a
-    /// single adjust handle name it <c>adj</c> (donut, noSmoking, …); writing the
-    /// generic <c>adj1</c> there yields a file real PowerPoint rejects. Presets
-    /// with multiple handles use <c>adj1</c>/<c>adj2</c>/… and pass through.
-    /// Unknown presets keep the caller-supplied name verbatim.
+    /// given <paramref name="preset"/> actually declares. A preset with a
+    /// single adjust handle names it <c>adj</c> (roundRect, donut, triangle,
+    /// chevron, …); writing the generic <c>adj1</c> there yields a file real
+    /// PowerPoint rejects, so the first supplied guide is renamed to the one
+    /// declared name. Multi-handle presets pass through (their names are
+    /// checked by <see cref="RejectUndeclaredAdjName"/>). Unknown presets keep
+    /// the caller-supplied name verbatim.
     /// </summary>
     private static string CanonicalAdjName(Drawing.ShapeTypeValues? preset, int index, string supplied)
     {
-        if (preset == null) return supplied;
-        // Single-handle presets: the one and only guide is named "adj".
-        if (index == 0 &&
-            (preset == Drawing.ShapeTypeValues.Donut
-             || preset == Drawing.ShapeTypeValues.NoSmoking))
-        {
-            return "adj";
-        }
+        if (preset == null || index != 0) return supplied;
+        if (PresetAdjustGuideNames.TryGetValue(PresetName(preset.Value), out var declared)
+            && declared.Length == 1)
+            return declared[0];
         return supplied;
+    }
+
+    /// <summary>
+    /// Throw when <paramref name="name"/> is not an adjust guide the preset
+    /// declares. Presets absent from <see cref="PresetAdjustGuideNames"/> are
+    /// not checked.
+    /// </summary>
+    /// <summary>
+    /// Bring an existing avLst in line with the geometry's CURRENT preset
+    /// after the preset changed (<c>set geometry=</c> / <c>set preset=</c>).
+    /// Guides the new preset does not declare are dropped — a roundRect's
+    /// <c>adj</c> left on an ellipse makes real PowerPoint refuse the file
+    /// (issue #235) — and a multi-guide preset left holding a partial set is
+    /// completed with its defaults, since PowerPoint rejects a subset too.
+    /// Guides the new preset declares keep their values. Presets absent from
+    /// <see cref="PresetAdjustGuideNames"/> are left untouched.
+    /// </summary>
+    internal static void ReconcileAdjustGuides(Drawing.PresetGeometry geom)
+    {
+        if (geom.Preset?.Value is not { } preset) return;
+        if (!PresetAdjustGuideNames.TryGetValue(PresetName(preset), out var declared)) return;
+        var avLst = geom.GetFirstChild<Drawing.AdjustValueList>();
+        if (avLst == null) return;
+        var kept = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var gd in avLst.Elements<Drawing.ShapeGuide>().ToList())
+        {
+            var n = gd.Name?.Value;
+            if (n != null && System.Array.IndexOf(declared, n) >= 0 && gd.Formula?.Value is { } f)
+                kept[n] = f;
+            gd.Remove();
+        }
+        if (kept.Count == 0) return;
+        if (TryGetMultiGuideDefaults(preset, out var defaults))
+        {
+            foreach (var (n, defFmla) in defaults)
+                avLst.AppendChild(new Drawing.ShapeGuide { Name = n, Formula = kept.TryGetValue(n, out var f) ? f : defFmla });
+            return;
+        }
+        foreach (var n in declared)
+            if (kept.TryGetValue(n, out var f))
+                avLst.AppendChild(new Drawing.ShapeGuide { Name = n, Formula = f });
+    }
+
+    // SDK v3 enum structs render as "ShapeTypeValues { }" under ToString();
+    // IEnumValue.Value is the OOXML token (prstGeom/@prst).
+    private static string PresetName(Drawing.ShapeTypeValues preset)
+        => ((DocumentFormat.OpenXml.IEnumValue)preset).Value;
+
+    private static void RejectUndeclaredAdjName(Drawing.ShapeTypeValues? preset, string entry, string name)
+    {
+        if (preset == null) return;
+        var prst = PresetName(preset.Value);
+        if (!PresetAdjustGuideNames.TryGetValue(prst, out var declared)) return;
+        if (System.Array.IndexOf(declared, name) >= 0) return;
+        throw new ArgumentException(declared.Length == 0
+            ? $"Invalid adj '{entry}': preset '{prst}' has no adjust handles. " +
+              "Remove adj, or choose a geometry that has them (e.g. roundRect, chevron, rightArrow)."
+            : $"Invalid adj '{entry}': preset '{prst}' declares adjust handle(s) {string.Join(", ", declared)}, not '{name}'.");
     }
 }

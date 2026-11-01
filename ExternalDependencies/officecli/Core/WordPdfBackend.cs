@@ -214,6 +214,8 @@ internal static class WordPdfBackend
         IntPtr dp = Marshal.AllocHGlobal(IntPtr.Size * 2 + 8);
         IntPtr result = Marshal.AllocHGlobal(VAR_SZ);
         Marshal.WriteInt64(result, 0); Marshal.WriteInt64(result, 8, 0); Marshal.WriteInt64(result, 16, 0);
+        IntPtr excep = Marshal.AllocHGlobal(EXCEPINFO_SZ);
+        for (int i = 0; i < EXCEPINFO_SZ; i += 8) Marshal.WriteInt64(excep, i, 0);
         try
         {
             for (int i = 0; i < args.Length; i++) Wv(argArr + (args.Length - 1 - i) * VAR_SZ, args[i]);
@@ -224,18 +226,69 @@ internal static class WordPdfBackend
             Marshal.WriteInt32(dp, IntPtr.Size * 2 + 4, isPut ? 1 : 0);
 
             var iid = Guid.Empty;
-            int hr = VT<F_Invoke>(d, 6)(d, dispId, ref iid, 0, flags, dp, result, IntPtr.Zero, IntPtr.Zero);
+            int hr = VT<F_Invoke>(d, 6)(d, dispId, ref iid, 0, flags, dp, result, excep, IntPtr.Zero);
+            if (hr == DISP_E_EXCEPTION) throw ExcepInfoError(name, hr, excep);
             if (hr != 0) throw new InvalidOperationException($"Invoke({name}) hr=0x{hr:X8}");
             return Rv(result);
         }
         finally
         {
+            for (int off = 8; off <= 24; off += 8) { var b = Marshal.ReadIntPtr(excep, off); if (b != IntPtr.Zero) SysFreeString(b); }
+            Marshal.FreeHGlobal(excep);
             Cv(result); Marshal.FreeHGlobal(result);
             Marshal.FreeHGlobal(dp);
             for (int i = 0; i < args.Length; i++) Cv(argArr + i * VAR_SZ);
             if (argArr != IntPtr.Zero) Marshal.FreeHGlobal(argArr);
             if (namedArr != IntPtr.Zero) Marshal.FreeHGlobal(namedArr);
         }
+    }
+
+    const int DISP_E_EXCEPTION = unchecked((int)0x80020009);
+    const int EXCEPINFO_SZ = 64;
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int F_FillExcep(IntPtr excep);
+
+    static COMException ExcepInfoError(string name, int hr, IntPtr excep)
+    {
+        var fill = Marshal.ReadIntPtr(excep, 48);
+        if (fill != IntPtr.Zero) try { Marshal.GetDelegateForFunctionPointer<F_FillExcep>(fill)(excep); } catch { }
+        int code = Marshal.ReadInt32(excep, 56);
+        if (code == 0) code = hr;
+        var descPtr = Marshal.ReadIntPtr(excep, 16);
+        var desc = descPtr != IntPtr.Zero ? Marshal.PtrToStringBSTR(descPtr).Trim() : "";
+        return new COMException($"{name} failed (0x{code:X8}){(desc.Length > 0 ? ": " + desc : "")}", code);
+    }
+
+    internal static IntPtr LaunchApp(Guid clsid)
+    {
+        var iid = G_IDispatch;
+        try { CoCreateInstance(ref clsid, IntPtr.Zero, 4, ref iid, out var app); return app; }
+        catch (Exception e) { throw new NativeRenderStageException(NativeRenderStage.Launch, e); }
+    }
+
+    internal static IntPtr OpenDocument(IntPtr collection, params object?[] args)
+    {
+        try { return (IntPtr)DispMethod(collection, "Open", args)!; }
+        catch (Exception e) { throw new NativeRenderStageException(NativeRenderStage.Open, e); }
+    }
+
+    internal static byte[]? RunOnSta(Func<byte[]?> work, int joinMs, out NativeRenderFailure? failure)
+    {
+        byte[]? result = null;
+        Exception? error = null;
+        var th = new Thread(() =>
+        {
+            try { result = work(); }
+            catch (Exception e) { error = e; }
+        });
+        th.SetApartmentState(ApartmentState.STA);
+        th.IsBackground = true;
+        th.Start();
+        if (!th.Join(joinMs)) { failure = NativeRenderFailure.TimedOut(joinMs); return null; }
+        failure = error != null ? NativeRenderFailure.FromException(error)
+            : result == null ? NativeRenderFailure.NothingRendered()
+            : null;
+        return result;
     }
 
     internal static void DispSet(IntPtr d, string name, object? v) => DispCall(d, name, 4, [v], true);
@@ -452,13 +505,12 @@ internal static class WordPdfBackend
     static string DocxToPdf(string docx)
     {
         var pdf = Path.Combine(Path.GetTempPath(), $"_w_{Guid.NewGuid():N}.pdf");
-        var clsid = G_Word; var iid = G_IDispatch;
-        CoCreateInstance(ref clsid, IntPtr.Zero, 4, ref iid, out var word);
+        var word = LaunchApp(G_Word);
         try
         {
             var name = (string?)DispGet(word, "Name") ?? "";
             if (!name.Contains("Microsoft Word", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("word_not_authentic: " + name);
+                throw new NativeRenderStageException(NativeRenderStage.Launch, new InvalidOperationException("word_not_authentic: " + name));
 
             DispSet(word, "Visible", false);
             DispSet(word, "DisplayAlerts", 0);
@@ -467,7 +519,7 @@ internal static class WordPdfBackend
             var docs = (IntPtr)DispGet(word, "Documents")!;
             try
             {
-                var doc = (IntPtr)DispMethod(docs, "Open", docx, MISSING, true, false)!;
+                var doc = OpenDocument(docs, docx, MISSING, true, false);
                 try { DispMethod(doc, "SaveAs2", pdf, 17); }
                 finally { try { DispMethod(doc, "Close", false); } catch { } Marshal.Release(doc); }
             }
@@ -635,34 +687,22 @@ internal static class WordPdfBackend
         return result;
     }
 
-    public static byte[]? Render(string docx, string pageFilter, int timeoutMs = 60000)
+    public static byte[]? Render(string docx, string pageFilter, out NativeRenderFailure? failure, int timeoutMs = 60000)
     {
-        byte[]? result = null;
-        Exception? error = null;
-        var th = new Thread(() =>
+        return RunOnSta(() =>
         {
             string? pdf = null;
             try
             {
                 pdf = DocxToPdf(docx);
                 var pngs = PdfToPngList(pdf, pageFilter, timeoutMs);
-                result = pngs.Count == 0 ? null : Stitch(pngs);
-            }
-            catch (Exception e)
-            {
-                error = e;
+                return pngs.Count == 0 ? null : Stitch(pngs);
             }
             finally
             {
                 if (pdf != null) try { File.Delete(pdf); } catch { }
             }
-        });
-        th.SetApartmentState(ApartmentState.STA);
-        th.IsBackground = true;
-        th.Start();
-        if (!th.Join(timeoutMs + 30000)) return null;
-        if (error != null) return null;
-        return result;
+        }, timeoutMs + 30000, out failure);
     }
 
     /// <summary>
@@ -671,20 +711,20 @@ internal static class WordPdfBackend
     /// into a <paramref name="cols"/>-column contact sheet. The docx analogue of
     /// PowerPointPngBackend.RenderGrid (which exports each slide at cell size via
     /// PowerPoint). Returns null on non-Windows, missing/inauthentic Word, or any
-    /// failure — caller falls back to the HTML grid. cellW/cellH are the FINAL
-    /// (already 1920-capped) cell size, so the stitched image needs no further cap.
+    /// failure — caller falls back to the HTML grid; <paramref name="failure"/>
+    /// carries the reason. cellW/cellH are the FINAL (already 1920-capped) cell
+    /// size, so the stitched image needs no further cap.
     /// </summary>
-    public static byte[]? RenderGrid(string docx, string pageFilter, int cellW, int cellH, int cols, int gap, int pad, int timeoutMs = 60000)
+    public static byte[]? RenderGrid(string docx, string pageFilter, int cellW, int cellH, int cols, int gap, int pad, out NativeRenderFailure? failure, int timeoutMs = 60000)
     {
-        byte[]? result = null;
-        var th = new Thread(() =>
+        return RunOnSta(() =>
         {
             string? pdf = null;
             try
             {
                 pdf = DocxToPdf(docx);
                 var nativePngs = PdfToPngList(pdf, pageFilter, timeoutMs);
-                if (nativePngs.Count == 0) return;
+                if (nativePngs.Count == 0) return null;
 
                 var clsid = G_WICFactory_C; var iid = G_WICFactory_I;
                 CoCreateInstance(ref clsid, IntPtr.Zero, 1, ref iid, out var factory);
@@ -697,17 +737,11 @@ internal static class WordPdfBackend
                         var scaled = ScaleBgra(px, w, h, cellW, cellH);
                         cells.Add(EncodeBgraToPng(factory, scaled, cellW, cellH));
                     }
-                    result = StitchGrid(cells, cols, gap, pad);
+                    return StitchGrid(cells, cols, gap, pad);
                 }
                 finally { Marshal.Release(factory); }
             }
-            catch { result = null; }
             finally { if (pdf != null) try { File.Delete(pdf); } catch { } }
-        });
-        th.SetApartmentState(ApartmentState.STA);
-        th.IsBackground = true;
-        th.Start();
-        if (!th.Join(timeoutMs + 30000)) return null;
-        return result;
+        }, timeoutMs + 30000, out failure);
     }
 }

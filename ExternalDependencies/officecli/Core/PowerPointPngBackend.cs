@@ -26,70 +26,52 @@ internal static class PowerPointPngBackend
     /// Render slides [startSlide..endSlide] (1-based, inclusive) to a single PNG
     /// at width×height pixels. A range is stitched top-to-bottom. Runs on a
     /// dedicated STA thread; returns null if the app is unavailable or any step
-    /// fails or exceeds the timeout.
-    public static byte[]? Render(string pptx, int startSlide, int endSlide, int width, int height, int timeoutMs = 60000)
+    /// fails or exceeds the timeout, with the reason in <paramref name="failure"/>.
+    public static byte[]? Render(string pptx, int startSlide, int endSlide, int width, int height, out NativeRenderFailure? failure, int timeoutMs = 60000)
     {
         // Keep within the multi-image LLM ceiling, same 1920 long-edge cap as the HTML path.
         var m = Math.Max(width, height);
         if (m > 1920) { var s = 1920.0 / m; width = Math.Max(1, (int)(width * s)); height = Math.Max(1, (int)(height * s)); }
 
-        byte[]? result = null;
-        Exception? error = null;
-        var th = new Thread(() =>
+        return WordPdfBackend.RunOnSta(() =>
         {
             var tmp = new List<string>();
-            try { result = RenderCore(pptx, startSlide, endSlide, width, height, timeoutMs, tmp); }
-            catch (Exception e) { error = e; }
+            try { return RenderCore(pptx, startSlide, endSlide, width, height, timeoutMs, tmp); }
             finally { foreach (var f in tmp) { try { File.Delete(f); } catch { /* ignore */ } } }
-        });
-        th.SetApartmentState(ApartmentState.STA);
-        th.IsBackground = true;
-        th.Start();
-        if (!th.Join(timeoutMs + 30000)) return null;
-        if (error != null) return null;
-        return result;
+        }, timeoutMs + 30000, out failure);
     }
 
     /// Render slides [startSlide..endSlide] (1-based; endSlide <= 0 means "to the
     /// last slide") into an N-column thumbnail grid. Each slide is exported at
     /// cellW×cellH and tiled with the given gap/padding (pixels) on a white
     /// background. Cells are scaled down if the composed image would exceed the
-    /// 1920 long-edge ceiling. Returns null on failure.
-    public static byte[]? RenderGrid(string pptx, int startSlide, int endSlide, int cellW, int cellH, int cols, int gap, int pad, int timeoutMs = 120000)
+    /// 1920 long-edge ceiling. Returns null on failure, with the reason in
+    /// <paramref name="failure"/>.
+    public static byte[]? RenderGrid(string pptx, int startSlide, int endSlide, int cellW, int cellH, int cols, int gap, int pad, out NativeRenderFailure? failure, int timeoutMs = 120000)
     {
-        byte[]? result = null;
-        Exception? error = null;
-        var th = new Thread(() =>
+        return WordPdfBackend.RunOnSta(() =>
         {
             var tmp = new List<string>();
-            try { result = RenderGridCore(pptx, startSlide, endSlide, cellW, cellH, cols, gap, pad, timeoutMs, tmp); }
-            catch (Exception e) { error = e; }
+            try { return RenderGridCore(pptx, startSlide, endSlide, cellW, cellH, cols, gap, pad, timeoutMs, tmp); }
             finally { foreach (var f in tmp) { try { File.Delete(f); } catch { /* ignore */ } } }
-        });
-        th.SetApartmentState(ApartmentState.STA);
-        th.IsBackground = true;
-        th.Start();
-        if (!th.Join(timeoutMs + 30000)) return null;
-        if (error != null) return null;
-        return result;
+        }, timeoutMs + 30000, out failure);
     }
 
     static byte[]? RenderGridCore(string pptx, int startSlide, int endSlide, int cellW, int cellH, int cols, int gap, int pad, int timeoutMs, List<string> tmp)
     {
         if (cols < 1) cols = 1;
-        var clsid = G_App; var iid = WordPdfBackend.G_IDispatch;
-        WordPdfBackend.CoCreateInstance(ref clsid, IntPtr.Zero, 4, ref iid, out var app);
+        var app = WordPdfBackend.LaunchApp(G_App);
         try
         {
             var name = (string?)WordPdfBackend.DispGet(app, "Name") ?? "";
             if (!name.Contains("PowerPoint", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("app_not_authentic: " + name);
+                throw new NativeRenderStageException(NativeRenderStage.Launch, new InvalidOperationException("app_not_authentic: " + name));
             try { WordPdfBackend.DispSet(app, "DisplayAlerts", 1); } catch { /* alerts-none; ignore if unsettable */ }
 
             var presentations = (IntPtr)WordPdfBackend.DispGet(app, "Presentations")!;
             try
             {
-                var pres = (IntPtr)WordPdfBackend.DispMethod(presentations, "Open", Path.GetFullPath(pptx), -1, 0, 0)!;
+                var pres = WordPdfBackend.OpenDocument(presentations, Path.GetFullPath(pptx), -1, 0, 0);
                 try
                 {
                     var slides = (IntPtr)WordPdfBackend.DispGet(pres, "Slides")!;
@@ -134,20 +116,19 @@ internal static class PowerPointPngBackend
 
     static byte[]? RenderCore(string pptx, int startSlide, int endSlide, int width, int height, int timeoutMs, List<string> tmp)
     {
-        var clsid = G_App; var iid = WordPdfBackend.G_IDispatch;
-        WordPdfBackend.CoCreateInstance(ref clsid, IntPtr.Zero, 4, ref iid, out var app);
+        var app = WordPdfBackend.LaunchApp(G_App);
         try
         {
             var name = (string?)WordPdfBackend.DispGet(app, "Name") ?? "";
             if (!name.Contains("PowerPoint", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("app_not_authentic: " + name);
+                throw new NativeRenderStageException(NativeRenderStage.Launch, new InvalidOperationException("app_not_authentic: " + name));
             try { WordPdfBackend.DispSet(app, "DisplayAlerts", 1); } catch { /* alerts-none; ignore if unsettable */ }
 
             var presentations = (IntPtr)WordPdfBackend.DispGet(app, "Presentations")!;
             try
             {
                 // Open(FileName, ReadOnly=-1, Untitled=0, WithWindow=0): read-only, no window.
-                var pres = (IntPtr)WordPdfBackend.DispMethod(presentations, "Open", Path.GetFullPath(pptx), -1, 0, 0)!;
+                var pres = WordPdfBackend.OpenDocument(presentations, Path.GetFullPath(pptx), -1, 0, 0);
                 try
                 {
                     var slides = (IntPtr)WordPdfBackend.DispGet(pres, "Slides")!;

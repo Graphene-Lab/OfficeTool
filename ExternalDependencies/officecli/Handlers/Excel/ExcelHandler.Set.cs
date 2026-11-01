@@ -16,9 +16,36 @@ namespace OfficeCli.Handlers;
 
 public partial class ExcelHandler
 {
+    // Resolve sheet-scoped paths before a resident promotes the handler and
+    // marks itself dirty. Keep selector and workbook-level dispatch in Set.
+    internal void ValidateSetSheet(string path)
+    {
+        if (!string.IsNullOrEmpty(path)
+            && (!path.StartsWith("/") || AttributeFilter.IsContentFilterPath(path)))
+            return;
+
+        path = ResolveSheetIndexInPath(NormalizeExcelPath(path));
+        if (path == "/" || Regex.IsMatch(path.TrimStart('/'), @"^namedrange\[(.+?)\]$", RegexOptions.IgnoreCase))
+            return;
+
+        var sheetName = path.TrimStart('/').Split('/', 2)[0];
+        if (FindWorksheet(sheetName) == null)
+            throw SheetNotFoundException(sheetName);
+    }
+
     public List<string> Set(string path, Dictionary<string, string> properties)
     {
-        Modified = true;
+        // A set that applied nothing (every prop unsupported) is a no-op and
+        // must not mark the document modified — it used to rewrite the file.
+        LastSelectorSetCount = 0;
+        var wasModified = Modified;
+        var unsupported = MarkModified(() => SetCore(path, properties));
+        if (properties.Count > 0 && unsupported.Count >= properties.Count) Modified = wasModified;
+        return unsupported;
+    }
+
+    private List<string> SetCore(string path, Dictionary<string, string> properties)
+    {
         // Batch Set: route to the shared filter engine when the path is a bare
         // selector (no `/`) OR a `/`-scoped path that carries a content filter
         // (e.g. `/Sheet1/cell[value>5000 or value<300]`). The latter would
@@ -44,13 +71,13 @@ public partial class ExcelHandler
                 // WHERE result, not a tool failure — surface not_found so the
                 // JSON envelope reads clean instead of internal_error.
                 throw new Core.CliException($"No elements matched selector: {path}") { Code = "not_found" };
-            LastSelectorSetCount = targets.Count;
             foreach (var target in targets)
             {
                 var targetUnsupported = Set(target.Path, properties);
                 foreach (var u in targetUnsupported)
                     if (!unsupported.Contains(u)) unsupported.Add(u);
             }
+            LastSelectorSetCount = targets.Count; // after the per-target calls, which reset it
             return unsupported;
         }
 
@@ -318,7 +345,7 @@ public partial class ExcelHandler
         {
             if (cellPreExisted)
                 // Rollback: restore cell to pre-modification state.
-                cell.Parent?.ReplaceChild(cellBackup, cell);
+                OfficeCli.Core.ElementRollback.RestoreInPlace(cell, cellBackup);
             else
                 // Newly created by this Set — remove it so a failed create
                 // leaves no ghost cell.

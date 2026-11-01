@@ -23,23 +23,14 @@ public partial class PowerPointHandler
             throw new ArgumentException($"Slide {slideIdx} not found (total: {slidePartsN.Count})");
         var notesPart = EnsureNotesSlidePart(slidePartsN[PathIndex.ToArrayIndex(slideIdx)]);
         var unsupportedN = new List<string>();
-        // Pull the notes body shape (idx=1 placeholder) so run-level keys
+        // Pull the notes body shape (type=body placeholder) so run-level keys
         // (lang, lang.*, font, size, color, …) route through the same
         // SetRunOrShapeProperties pipeline as regular slide shapes.
         // CONSISTENCY(notes-shape-set): notes had its own bespoke key
         // handling that recognised only text/direction; other run keys
         // surfaced as UNSUPPORTED. The notes body is just a Shape — it
         // should accept the full run-attr surface.
-        Shape? notesBody = null;
-        var notesShapeTree = notesPart.NotesSlide?.CommonSlideData?.ShapeTree;
-        if (notesShapeTree != null)
-        {
-            foreach (var sh in notesShapeTree.Elements<Shape>())
-            {
-                var ph = sh.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties?.GetFirstChild<PlaceholderShape>();
-                if (ph?.Index?.Value == 1) { notesBody = sh; break; }
-            }
-        }
+        var notesBody = FindNotesBodyShape(notesPart.NotesSlide?.CommonSlideData?.ShapeTree);
 
         var deferredRunProps = new Dictionary<string, string>();
         foreach (var (key, value) in properties)
@@ -88,7 +79,7 @@ public partial class PowerPointHandler
                     || partType.Equals("master", StringComparison.OrdinalIgnoreCase);
         if (isMaster)
         {
-            var masters = presentationPart.SlideMasterParts.ToList();
+            var masters = MastersInOrder(presentationPart);
             if (partIdx < 1 || partIdx > masters.Count)
                 throw new ArgumentException($"SlideMaster {partIdx} not found (total: {masters.Count})");
             ownerPart = masters[partIdx - 1];
@@ -117,10 +108,10 @@ public partial class PowerPointHandler
         var mIdx = int.Parse(nestedMatch.Groups[1].Value);
         var lIdx = int.Parse(nestedMatch.Groups[2].Value);
         var presentationPart = _doc.PresentationPart!;
-        var masters = presentationPart.SlideMasterParts.ToList();
+        var masters = MastersInOrder(presentationPart);
         if (mIdx < 1 || mIdx > masters.Count)
             throw new ArgumentException($"SlideMaster {mIdx} not found (total: {masters.Count})");
-        var layouts = masters[mIdx - 1].SlideLayoutParts.ToList();
+        var layouts = LayoutsInOrder(masters[mIdx - 1]);
         if (lIdx < 1 || lIdx > layouts.Count)
             throw new ArgumentException($"SlideLayout {lIdx} not found under master {mIdx} (total: {layouts.Count})");
         var lp = layouts[lIdx - 1];
@@ -192,14 +183,14 @@ public partial class PowerPointHandler
         if (masterBgMatch.Success)
         {
             var masterIdx = int.Parse(masterBgMatch.Groups[1].Value);
-            var masters = _doc.PresentationPart?.SlideMasterParts?.ToList() ?? [];
+            var masters = _doc.PresentationPart is { } ppM ? MastersInOrder(ppM) : [];
             if (masterIdx < 1 || masterIdx > masters.Count)
                 throw new ArgumentException($"Slide master {masterIdx} not found (total: {masters.Count})");
             var mp = masters[masterIdx - 1];
             if (masterBgMatch.Groups[2].Success)
             {
                 var lIdx = int.Parse(masterBgMatch.Groups[2].Value);
-                var layouts = mp.SlideLayoutParts?.ToList() ?? [];
+                var layouts = LayoutsInOrder(mp);
                 if (lIdx < 1 || lIdx > layouts.Count)
                     throw new ArgumentException($"Slide layout {lIdx} not found under master {masterIdx} (total: {layouts.Count})");
                 targetPart = layouts[lIdx - 1];
@@ -216,8 +207,7 @@ public partial class PowerPointHandler
         else
         {
             var lIdx = int.Parse(layoutBgMatch.Groups[1].Value);
-            var allLayouts = (_doc.PresentationPart?.SlideMasterParts ?? Enumerable.Empty<SlideMasterPart>())
-                .SelectMany(m => m.SlideLayoutParts ?? Enumerable.Empty<SlideLayoutPart>()).ToList();
+            var allLayouts = _doc.PresentationPart is { } ppL ? LayoutsInOrder(ppL) : [];
             if (lIdx < 1 || lIdx > allLayouts.Count)
                 throw new ArgumentException($"Slide layout {lIdx} not found (total: {allLayouts.Count})");
             targetPart = allLayouts[lIdx - 1];

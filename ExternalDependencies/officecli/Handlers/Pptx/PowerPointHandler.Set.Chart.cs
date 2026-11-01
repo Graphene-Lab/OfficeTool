@@ -107,7 +107,10 @@ public partial class PowerPointHandler
         List<string> unsupported;
         if (chartPart != null)
         {
+            // #452: keep an embedded chart workbook in step with the data.
+            var embeddedData = ChartEmbeddedDataSync.Capture(chartPart);
             unsupported = ChartHelper.SetChartProperties(chartPart, chartProps);
+            ChartEmbeddedDataSync.Restore(chartPart, embeddedData);
         }
         else if (extChartPart != null)
         {

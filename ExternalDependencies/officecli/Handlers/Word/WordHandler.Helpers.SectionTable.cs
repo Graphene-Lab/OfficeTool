@@ -35,7 +35,13 @@ public partial class WordHandler
 
     /// <summary>
     /// Ensure PageSize exists in SectionProperties in correct schema order.
-    /// Schema order: SectionType, PageSize, PageMargin, ...
+    /// CT_SectPr's child sequence is strict (headerReference*, footerReference*,
+    /// footnotePr, endnotePr, type, pgSz, pgMar, …), so a newly created pgSz is
+    /// placed by rank via InsertSectPrChildInOrder rather than by a hand-rolled
+    /// position. The previous code fell back to PrependChild when the section
+    /// had neither a w:type nor a header/footer reference, which put pgSz ahead
+    /// of an existing footnotePr/endnotePr and made the document fail
+    /// validation.
     /// </summary>
     private static PageSize EnsureSectPrPageSize(SectionProperties sectPr)
     {
@@ -43,33 +49,14 @@ public partial class WordHandler
         if (existing != null) return existing;
 
         var ps = new PageSize();
-        // Insert after SectionType if present, then after FooterReference/HeaderReference,
-        // otherwise prepend. OOXML schema order: headerReference*, footerReference*, ..., sectType, pgSz, pgMar
-        var sectionType = sectPr.GetFirstChild<SectionType>();
-        if (sectionType != null)
-        {
-            sectionType.InsertAfterSelf(ps);
-        }
-        else
-        {
-            // Find the last HeaderReference or FooterReference to insert after
-            OpenXmlElement? lastRef = null;
-            foreach (var child in sectPr.ChildElements)
-            {
-                if (child is HeaderReference || child is FooterReference)
-                    lastRef = child;
-            }
-            if (lastRef != null)
-                lastRef.InsertAfterSelf(ps);
-            else
-                sectPr.PrependChild(ps);
-        }
+        InsertSectPrChildInOrder(sectPr, ps);
         return ps;
     }
 
     /// <summary>
     /// Ensure PageMargin exists in SectionProperties in correct schema order.
-    /// Schema order: SectionType, PageSize, PageMargin, ...
+    /// Same rank-based placement as <see cref="EnsureSectPrPageSize"/> — pgMar
+    /// follows headerReference/footerReference/footnotePr/endnotePr/type/pgSz.
     /// </summary>
     private static PageMargin EnsureSectPrPageMargin(SectionProperties sectPr)
     {
@@ -77,29 +64,7 @@ public partial class WordHandler
         if (existing != null) return existing;
 
         var pm = new PageMargin();
-        // Insert after PageSize if present, after SectionType, after last headerRef/footerRef, or prepend
-        var pageSize = sectPr.GetFirstChild<PageSize>();
-        if (pageSize != null)
-            pageSize.InsertAfterSelf(pm);
-        else
-        {
-            var sectionType = sectPr.GetFirstChild<SectionType>();
-            if (sectionType != null)
-                sectionType.InsertAfterSelf(pm);
-            else
-            {
-                OpenXmlElement? lastRef = null;
-                foreach (var child in sectPr.ChildElements)
-                {
-                    if (child is HeaderReference || child is FooterReference)
-                        lastRef = child;
-                }
-                if (lastRef != null)
-                    lastRef.InsertAfterSelf(pm);
-                else
-                    sectPr.PrependChild(pm);
-            }
-        }
+        InsertSectPrChildInOrder(sectPr, pm);
         return pm;
     }
 

@@ -19,6 +19,8 @@ public partial class ExcelHandler
 {
     private string AddSheet(string parentPath, string type, InsertPosition? position, Dictionary<string, string> properties)
     {
+        if (parentPath.TrimStart('/').Contains('/'))
+            RejectSheetPathSuffix(parentPath, "sheet", "Use / or an existing sheet path (/Sheet1) as the parent; position with --index.");
         var index = position?.Index;
         var workbookPart = _doc.WorkbookPart
             ?? throw new InvalidOperationException("Workbook not found");
@@ -166,8 +168,23 @@ public partial class ExcelHandler
         return true;
     }
 
+    /// <summary>
+    /// `add --type row|col|sheet` takes a SHEET path. A cell or range suffix
+    /// (/Sheet1/Z9) used to be dropped without a word, so the element landed at
+    /// the default position while the caller believed it had named one.
+    /// </summary>
+    private static void RejectSheetPathSuffix(string parentPath, string what, string positionHint)
+    {
+        var segs = parentPath.TrimStart('/').Split('/', 2);
+        if (segs.Length > 1 && segs[1].Length > 0)
+            throw new Core.CliException(
+                $"add --type {what} takes a sheet path (/{segs[0]}); the '{segs[1]}' suffix in '{parentPath}' is not used.")
+            { Code = "invalid_path", Suggestion = positionHint };
+    }
+
     private string AddRow(string parentPath, string type, InsertPosition? position, Dictionary<string, string> properties)
     {
+        RejectSheetPathSuffix(parentPath, "row", "Position a row with --index N, --after /Sheet1/row[K] or --before /Sheet1/row[K].");
         var segments = parentPath.TrimStart('/').Split('/', 2);
         var sheetName = segments[0];
         var worksheet = FindWorksheet(sheetName)
@@ -530,8 +547,12 @@ public partial class ExcelHandler
             // formula — UNLESS type=string was supplied (explicitly, or forced
             // by the apostrophe branch above). Mirrors the Set-path gate; see
             // ExcelHandler.Set.cs case "value".
-            var addForcedString = properties.TryGetValue("type", out var addTypeVal)
-                && addTypeVal.Equals("string", StringComparison.OrdinalIgnoreCase);
+            // The Text number format ("@") — already on the cell, or applied
+            // by this same call — keeps an '='-leading entry literal, as in Set.
+            var addForcedString = (properties.TryGetValue("type", out var addTypeVal)
+                    && addTypeVal.Equals("string", StringComparison.OrdinalIgnoreCase))
+                || IsTextNumberFormat(properties)
+                || CellCarriesTextFormat(cell);
             if (!addForcedString && value.StartsWith('=') && value.Length > 1)
             {
                 RejectCrossWorkbookFormula(value);
@@ -599,7 +620,17 @@ public partial class ExcelHandler
                         ExcelDataFormatter.ToExcelSerial(inferredDate, IsWorkbookDate1904()).ToString(System.Globalization.CultureInfo.InvariantCulture));
                     cell.DataType = null;
                 }
-                else if (!double.TryParse(safeValue, out var dbl) || !double.IsFinite(dbl))
+                // Identifier-shaped digit strings (leading zero, >15 digits)
+                // are text unless the caller says type=number — the same rule
+                // Set and import apply; numeric storage loses the zeros / tail.
+                else if (LooksLikeIdentifierNotNumber(safeValue)
+                    && !(properties.TryGetValue("type", out var addNumType)
+                         && addNumType.ToLowerInvariant() is "number" or "num"))
+                    cell.DataType = new EnumValue<CellValues>(CellValues.String);
+                // HasValidThousandsGrouping: AllowThousands reads "1,5" as 15,
+                // silently 10x-ing a decimal-comma value (issue #352 follow-up).
+                else if (!HasValidThousandsGrouping(safeValue)
+                    || !double.TryParse(safeValue, out var dbl) || !double.IsFinite(dbl))
                     cell.DataType = new EnumValue<CellValues>(CellValues.String);
                 else
                     // R-fuzz2-1: TryParse accepts spellings Excel's <v> parser
@@ -939,7 +970,10 @@ public partial class ExcelHandler
             // non-numeric content survive the round-trip. Without this, a
             // value like "00456" gets written as <x:v>00456</x:v> with no
             // t="str" and Excel reparses it as 456 on open.
+            // Only when this call supplied a value — an Add that targets an
+            // existing cell with formatting props alone must not retype it.
             if (IsTextNumberFormat(cellStyleProps)
+                && properties.ContainsKey("value")
                 && cell.DataType?.Value != CellValues.SharedString
                 && cell.DataType?.Value != CellValues.InlineString
                 && cell.CellFormula == null)
@@ -1006,7 +1040,7 @@ public partial class ExcelHandler
             {
                 // Restore the pre-existing cell to its original state so a
                 // failed Add makes no partial change (mirrors Set-side rollback).
-                cell.Parent?.ReplaceChild(cellBackup, cell);
+                OfficeCli.Core.ElementRollback.RestoreInPlace(cell, cellBackup);
             }
             else
             {
@@ -1029,6 +1063,7 @@ public partial class ExcelHandler
 
     private string AddCol(string parentPath, string type, InsertPosition? position, Dictionary<string, string> properties)
     {
+        RejectSheetPathSuffix(parentPath, "col", "Position a column with --index N, --after /Sheet1/col[X] or --before /Sheet1/col[X].");
         var colSegments = parentPath.TrimStart('/').Split('/', 2);
         var colSheetName = colSegments[0];
         var colWorksheet = FindWorksheet(colSheetName)
@@ -1226,7 +1261,7 @@ public partial class ExcelHandler
         if (runCell.DataType?.Value == CellValues.SharedString &&
             int.TryParse(runCell.CellValue?.Text, out var existingSstIdx))
         {
-            runSsi = runSst.Elements<SharedStringItem>().ElementAtOrDefault(existingSstIdx);
+            runSsi = SharedStringAt(runSst, existingSstIdx);
         }
         if (runSsi == null)
         {
@@ -1236,7 +1271,7 @@ public partial class ExcelHandler
             // first run to a cell that already had a value threw the value away
             // (e.g. value="Hello World" + add run "Hi" → cell became just "Hi").
             string? runExistingText = runCell.DataType?.Value == CellValues.InlineString
-                ? runCell.InlineString?.InnerText
+                ? RstTextWithoutPhonetic(runCell.InlineString)
                 : runCell.CellValue?.Text;
 
             runSsi = new SharedStringItem();
@@ -1245,6 +1280,7 @@ public partial class ExcelHandler
                     new Text(runExistingText) { Space = SpaceProcessingModeValues.Preserve }));
             runCell.RemoveAllChildren<InlineString>();
             runSst.AppendChild(runSsi);
+            InvalidateSharedStringIndex(runSst);
             var newSstIdx = runSst.Elements<SharedStringItem>().Count() - 1;
             runCell.CellValue = new CellValue(newSstIdx.ToString());
             runCell.DataType = new EnumValue<CellValues>(CellValues.SharedString);
@@ -1563,6 +1599,7 @@ public partial class ExcelHandler
         }
 
         sst.AppendChild(ssi);
+        InvalidateSharedStringIndex(sst);
         sst.Count = (uint)sst.Elements<SharedStringItem>().Count();
         sst.UniqueCount = sst.Count;
 
@@ -1589,8 +1626,7 @@ public partial class ExcelHandler
             && int.TryParse(cell.CellValue?.Text, out var existingIdx))
         {
             var existingSstPart = _doc.WorkbookPart?.GetPartsOfType<SharedStringTablePart>().FirstOrDefault();
-            var existingSsi = existingSstPart?.SharedStringTable?
-                .Elements<SharedStringItem>().ElementAtOrDefault(existingIdx);
+            var existingSsi = SharedStringAt(existingSstPart?.SharedStringTable, existingIdx);
             baseText = existingSsi?.Text?.Text
                 ?? string.Concat(existingSsi?.Elements<Run>().Select(r => r.Text?.Text ?? "")
                     ?? Enumerable.Empty<string>());
@@ -1621,6 +1657,7 @@ public partial class ExcelHandler
         ssi.AppendChild(rPh);
 
         sst.AppendChild(ssi);
+        InvalidateSharedStringIndex(sst);
         sst.Count = (uint)sst.Elements<SharedStringItem>().Count();
         sst.UniqueCount = sst.Count;
 

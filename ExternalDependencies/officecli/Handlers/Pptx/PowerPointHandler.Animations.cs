@@ -1689,6 +1689,38 @@ public partial class PowerPointHandler
                 .Where(b => b.ShapeId?.Value == spIdStr).ToList())
                 bg.Remove();
         }
+
+        PruneEmptyTiming(timing);
+    }
+
+    /// <summary>
+    /// Drop the containers that removing a shape's animations can leave empty.
+    /// CT_TimeNodeList and CT_BuildList both require at least one child, so an
+    /// empty mainSeq childTnLst or an empty bldLst fails schema validation.
+    /// When nothing is left to run, the whole p:timing goes, which is what
+    /// PowerPoint writes for a slide without animations.
+    /// </summary>
+    private static void PruneEmptyTiming(Timing timing)
+    {
+        if (timing.BuildList != null && !timing.BuildList.HasChildren)
+            timing.BuildList.Remove();
+
+        // Main sequence with nothing left in it.
+        foreach (var seq in timing.Descendants<SequenceTimeNode>().ToList())
+        {
+            var ctn = seq.CommonTimeNode;
+            if (ctn?.NodeType?.Value == TimeNodeValues.MainSequence
+                && ctn.ChildTimeNodeList != null && !ctn.ChildTimeNodeList.HasChildren)
+                seq.Remove();
+        }
+
+        // Root time node with no children left (no main sequence, no media nodes).
+        var root = timing.TimeNodeList?.GetFirstChild<ParallelTimeNode>()?.CommonTimeNode;
+        if (root != null && (root.ChildTimeNodeList == null || !root.ChildTimeNodeList.HasChildren))
+            timing.TimeNodeList!.Remove();
+
+        if (!timing.HasChildren)
+            timing.Remove();
     }
 
     // ==================== Motion Path Animations ====================

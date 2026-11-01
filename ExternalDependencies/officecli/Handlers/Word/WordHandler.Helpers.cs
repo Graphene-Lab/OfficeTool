@@ -116,6 +116,19 @@ public partial class WordHandler
         ParseHelpers.IsTruthy(value);
 
     /// <summary>
+    /// BUG #334: true when a run carries non-text content — a drawing
+    /// (<c>w:drawing</c>), a VML picture (<c>w:pict</c>), an
+    /// <c>mc:AlternateContent</c> shape wrapper, an embedded object
+    /// (<c>w:object</c>), or a field (<c>w:fldChar</c> / <c>w:instrText</c>).
+    /// Paragraph-level <c>set --prop text=</c> must preserve such runs instead
+    /// of wiping them, or it silently deletes every graphic in the paragraph.
+    /// </summary>
+    private static bool RunCarriesNonText(Run run) =>
+        run.ChildElements.Any(c =>
+            c is Drawing or Picture or EmbeddedObject or FieldChar or FieldCode
+            || c is AlternateContent);
+
+    /// <summary>
     /// BUG-R7-07: a value the user explicitly typed as "false"/"0"/"off" — not
     /// just any non-truthy input (null/empty count as "no override"). Used by
     /// AddParagraph's no-text fallback to decide whether to emit
@@ -163,15 +176,22 @@ public partial class WordHandler
         if (body == null) return 0;
         foreach (var para in body.Descendants<Paragraph>())
         {
-            var rs = para.Descendants<CommentRangeStart>()
+            // A ranged comment anchors at its CommentRangeStart; a point
+            // (reference-only) comment has no range markers and anchors at the
+            // run that carries its CommentReference. The latter used to be
+            // ignored, so every point comment dumped as runStart=0 and replay
+            // appended its reference run at the paragraph end.
+            OpenXmlElement? anchor = para.Descendants<CommentRangeStart>()
                 .FirstOrDefault(r => r.Id?.Value == commentId);
-            if (rs == null) continue;
-            // Count Run elements that appear before the CommentRangeStart in
-            // document order within the same paragraph.
+            anchor ??= para.Descendants<CommentReference>()
+                .FirstOrDefault(r => r.Id?.Value == commentId)?.Parent;
+            if (anchor == null) continue;
+            // Count Run elements that appear before the anchor in document
+            // order within the same paragraph.
             int runCount = 0;
             foreach (var el in para.Descendants())
             {
-                if (ReferenceEquals(el, rs)) break;
+                if (ReferenceEquals(el, anchor)) break;
                 if (el is Run r && r.GetFirstChild<CommentReference>() == null) runCount++;
             }
             return runCount; // 0 = before any run; N = after run N (1-based)

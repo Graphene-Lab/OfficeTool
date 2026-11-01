@@ -218,8 +218,10 @@ public partial class ExcelHandler
         RefreshStaleChartCaches();
         foreach (var part in _dirtyWorksheets)
         {
-            ReorderWorksheetChildren(GetSheet(part));
-            GetSheet(part).Save();
+            var ws = GetSheet(part);
+            SyncSheetDimension(ws);
+            ReorderWorksheetChildren(ws);
+            ws.Save();
         }
         _dirtyWorksheets.Clear();
         if (_dirtyStylesheet)
@@ -227,6 +229,54 @@ public partial class ExcelHandler
             _doc.WorkbookPart?.WorkbookStylesPart?.Stylesheet?.Save();
             _dirtyStylesheet = false;
         }
+    }
+
+    /// <summary>
+    /// Bring <c>&lt;dimension ref&gt;</c> back in line with the rows and cells that
+    /// actually exist. Excel treats the element as advisory, but readers such as
+    /// openpyxl in read_only mode and dimension-driven Java/JS parsers use it as
+    /// the iteration bound — a row appended past the declared range is invisible
+    /// to them even though it is in sheetData. Runs once per dirty worksheet at
+    /// flush time, so every mutation path (row/col insert or delete, cell
+    /// auto-vivify, import) is covered by the same walk. Only maintained when
+    /// the source already carries one: officecli's own blanks never write the
+    /// (optional) element and readers fall back to scanning sheetData for it.
+    /// </summary>
+    private static void SyncSheetDimension(Worksheet ws)
+    {
+        var dim = ws.GetFirstChild<SheetDimension>();
+        if (dim == null) return;
+        var sheetData = ws.GetFirstChild<SheetData>();
+        uint minRow = 0, maxRow = 0;
+        int minCol = 0, maxCol = 0;
+        if (sheetData != null)
+        {
+            foreach (var row in sheetData.Elements<Row>())
+            {
+                var r = row.RowIndex?.Value ?? 0u;
+                if (r == 0) continue;
+                if (minRow == 0 || r < minRow) minRow = r;
+                if (r > maxRow) maxRow = r;
+                int c = 0;
+                foreach (var cell in row.Elements<Cell>())
+                {
+                    // An omitted cell reference means the next column in this
+                    // row, not an unused cell. Explicit references reset it.
+                    c = cell.CellReference?.Value is { } cref
+                        ? ColumnNameToIndex(ParseCellReference(cref).Column)
+                        : c + 1;
+                    if (minCol == 0 || c < minCol) minCol = c;
+                    if (c > maxCol) maxCol = c;
+                }
+            }
+        }
+        if (maxRow == 0) { dim.Reference = "A1"; return; } // empty sheet, as Excel writes it
+        if (maxCol == 0) { minCol = maxCol = 1; }           // rows exist but hold no cells
+        var first = $"{IndexToColumnName(minCol)}{minRow}";
+        var last = $"{IndexToColumnName(maxCol)}{maxRow}";
+        var reference = first == last ? first : $"{first}:{last}";
+        if (!string.Equals(dim.Reference?.Value, reference, StringComparison.Ordinal))
+            dim.Reference = reference;
     }
 
     /// <summary>
@@ -242,29 +292,40 @@ public partial class ExcelHandler
     }
 
     /// <summary>
-    /// Reorder worksheet children to match OpenXML schema sequence.
-    /// Schema: sheetPr, dimension, sheetViews, sheetFormatPr, cols, sheetData,
-    ///   autoFilter, sortState, mergeCells, conditionalFormatting,
-    ///   dataValidations, hyperlinks, printOptions, pageMargins, pageSetup,
-    ///   headerFooter, drawing, legacyDrawing, tableParts, extLst
+    /// Reorder worksheet children to match the CT_Worksheet schema sequence
+    /// (ECMA-376 §18.3.1.99). Runs on every dirty sheet at save.
     /// </summary>
+    // The full CT_Worksheet sequence. This MUST be complete: an element missing
+    // from the table falls to the "unknown" slot after tableParts, and Excel
+    // refuses to open a sheet whose children are out of order. The table used
+    // to stop at drawing/legacyDrawing/tableParts, so a sheet holding a chart
+    // plus <ignoredErrors> (or cellWatches, customProperties, smartTags,
+    // picture, oleObjects, controls, …) came out of ANY edit with those
+    // elements after <drawing> and prompted a repair — issue #389.
+    private static readonly string[] s_ctWorksheetOrder =
+    {
+        "sheetPr", "dimension", "sheetViews", "sheetFormatPr", "cols", "sheetData",
+        "sheetCalcPr", "sheetProtection", "protectedRanges", "scenarios", "autoFilter",
+        "sortState", "dataConsolidate", "customSheetViews", "mergeCells", "phoneticPr",
+        "conditionalFormatting", "dataValidations", "hyperlinks", "printOptions",
+        "pageMargins", "pageSetup", "headerFooter", "rowBreaks", "colBreaks",
+        "customProperties", "cellWatches", "ignoredErrors", "smartTags", "drawing",
+        "legacyDrawing", "legacyDrawingHF", "drawingHF", "picture", "oleObjects",
+        "controls", "webPublishItems", "tableParts", "extLst",
+    };
+
+    private static readonly Dictionary<string, int> s_ctWorksheetRank =
+        s_ctWorksheetOrder.Select((name, i) => (name, i)).ToDictionary(p => p.name, p => p.i);
+
     private static void ReorderWorksheetChildren(Worksheet ws)
     {
-        var order = new Dictionary<string, int>
-        {
-            ["sheetPr"] = 0, ["dimension"] = 1, ["sheetViews"] = 2, ["sheetFormatPr"] = 3,
-            ["cols"] = 4, ["sheetData"] = 5, ["sheetCalcPr"] = 6, ["sheetProtection"] = 7,
-            ["protectedRanges"] = 8, ["scenarios"] = 9, ["autoFilter"] = 10, ["sortState"] = 11,
-            ["dataConsolidate"] = 12, ["customSheetViews"] = 13, ["mergeCells"] = 14,
-            ["phoneticPr"] = 15, ["conditionalFormatting"] = 16, ["dataValidations"] = 17,
-            ["hyperlinks"] = 18, ["printOptions"] = 19, ["pageMargins"] = 20,
-            ["pageSetup"] = 21, ["headerFooter"] = 22, ["rowBreaks"] = 23, ["colBreaks"] = 24,
-            ["drawing"] = 25, ["legacyDrawing"] = 26, ["tableParts"] = 27, ["extLst"] = 99
-        };
-
+        // Unknown (foreign / mc:) children sort just before extLst, keeping their
+        // relative order — OrderBy is stable. Ranks are doubled so the unknown
+        // slot can sit strictly between tableParts and extLst.
+        int unknownRank = s_ctWorksheetRank["extLst"] * 2 - 1;
         var children = ws.ChildElements.ToList();
         var sorted = children
-            .OrderBy(c => order.TryGetValue(c.LocalName, out var idx) ? idx : 50)
+            .OrderBy(c => s_ctWorksheetRank.TryGetValue(c.LocalName, out var idx) ? idx * 2 : unknownRank)
             .ToList();
 
         bool needsReorder = false;
@@ -511,10 +572,12 @@ public partial class ExcelHandler
                         if (sst != null && cell.CellValue?.Text != null
                             && int.TryParse(cell.CellValue.Text, out var sstIdx))
                         {
-                            var items = sst.Elements<SharedStringItem>().ToList();
-                            if (sstIdx >= 0 && sstIdx < items.Count)
+                            // Resolve through the shared index rather than materializing the
+                            // table here: this runs once per cell, so a per-call ToList() is
+                            // O(n) per cell and makes a whole-sheet find/replace O(n²).
+                            var si = SharedStringAt(sst, sstIdx);
+                            if (si != null)
                             {
-                                var si = items[sstIdx];
                                 var siText = si.GetFirstChild<Text>();
                                 if (siText?.Text != null)
                                 {

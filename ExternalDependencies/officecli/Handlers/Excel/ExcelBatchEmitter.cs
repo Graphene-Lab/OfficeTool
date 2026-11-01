@@ -903,7 +903,7 @@ public static partial class ExcelBatchEmitter
     {
         if (text.Length == 0) return false;
         if (text.StartsWith('\'')) return true;
-        if (double.TryParse(text, NumberStyles.Any, CultureInfo.InvariantCulture, out _)) return true;
+        if (NumericText.TryParse(text, out _)) return true;
         if (text.Equals("TRUE", StringComparison.OrdinalIgnoreCase)
             || text.Equals("FALSE", StringComparison.OrdinalIgnoreCase)) return true;
         // ISO-date shapes import converts to serials.

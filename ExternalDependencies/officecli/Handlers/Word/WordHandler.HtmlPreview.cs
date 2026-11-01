@@ -785,7 +785,7 @@ public partial class WordHandler
           });
           if(sch>maxBodyH-sfH+2){settled=false;break;}
         }
-        if(settled){positionFootnotes();wrapFloats();applyLineNumbers();applyPageFilter();return;}
+        if(settled){positionFootnotes();wrapFloats();applyLineNumbers();applyPageFilter();if(window._gridCols>0){layoutGrid(window._gridCols);}else{flushScreenshotPage();}return;}
       }
     }
     for(var pi=0;pi<loopLim;pi++){
@@ -1081,7 +1081,7 @@ public partial class WordHandler
       document.querySelectorAll('a[id^=""_Toc""]').forEach(function(a){
         for(var i=0;i<pgs.length;i++) if(pgs[i].contains(a)){pmap.push(a.id+'='+(i+1));break;}
       });
-      if(window._gridCols>0){layoutGrid(window._gridCols);}
+      if(window._gridCols>0){applyPageFilter();layoutGrid(window._gridCols);}
       else{applyPageFilter();flushScreenshotPage();}
       document.title='PAGES:'+pgs.length+(pmap.length?'|MAP:'+pmap.join(','):'');
     }
@@ -1256,13 +1256,24 @@ public partial class WordHandler
     var avail=document.body.clientWidth-2*pad;
     var cellW=Math.floor((avail-(cols-1)*gap)/cols);
     if(cellW<1)cellW=window._gridCellW||220;
-    var wraps=Array.prototype.filter.call(document.querySelectorAll('.page-wrapper'),function(w){return w.offsetParent!==null;});
+    // A --page range hides the pages outside it (applyPageFilter); their
+    // wrappers must not take a cell, so hide them too and tile the rest.
+    var wraps=Array.prototype.filter.call(document.querySelectorAll('.page-wrapper'),function(w){
+      if(w.offsetParent===null)return false;
+      var pg=w.querySelector('.page');
+      if(pg&&pg.style.display==='none'){w.style.display='none';return false;}
+      return true;
+    });
     wraps.forEach(function(wrapper){
       var page=wrapper.querySelector('.page');if(!page)return;
       var pageW=page.offsetWidth,pageH=page.offsetHeight;
       var s=pageW>0?cellW/pageW:1;
       page.style.transition='none';page.style.transformOrigin='top left';
       page.style.transform='scale('+s+')';
+      // The page centres itself with margin:0 auto; with a top-left scale that
+      // auto margin shifts the scaled page right by (cellW-pageW)/2 and clips
+      // it at one column (issue #483). The wrapper is the cell: pin the page.
+      page.style.margin='0';
       page.style.boxShadow='none';page.style.borderRadius='0';
       wrapper.style.transition='none';wrapper.style.margin='0';
       wrapper.style.width=cellW+'px';wrapper.style.height=Math.round(pageH*s)+'px';
@@ -2477,7 +2488,6 @@ public partial class WordHandler
         // "continue" behavior) unless a <w:lvlOverride><w:startOverride/>
         // resets it. The HTML path keeps currentNumId locally for nesting.
         var olState = new OrderedListNumberingState();
-        var headingCounters = new Dictionary<int, int>(); // ilvl → counter for heading auto-numbering from style numPr
         bool pendingLiClose = false; // defer </li> to allow nested lists inside
         bool inMultiColumn = false; // track whether we're inside a multi-column div
 
@@ -2870,17 +2880,11 @@ public partial class WordHandler
                     // even when a deeper item carried the level over. Mirrors the
                     // text path (GetListPrefix), which arms on every CurrentNumId
                     // change — both feed the same AdvanceOrderedCounter.
-                    if (numId != currentNumId)
-                    {
-                        olState.PendingInstanceOverride.Clear();
-                        // Skip lvlRestart="0" levels: a never-restart continued
-                        // level keeps counting across the switch rather than
-                        // jumping to the override value (see GetListPrefix).
-                        for (int lv = 0; lv <= 8; lv++)
-                            if (GetNumInstanceOverrideStart(numId, lv).HasValue
-                                && GetEffectiveLvlRestart(numId, lv) != 0)
-                                olState.PendingInstanceOverride.Add(lv);
-                    }
+                    // EnterOrderedNum keys on the SHARED state's active num, so a
+                    // list switch that happened inside a table cell (#512) is
+                    // seen here too — the body list after the cell list used to
+                    // continue the cell list's count (4, 5 instead of 1, 2).
+                    EnterOrderedNum(olState, numId);
 
                     // When numId changes, decide: nesting or new list
                     if (currentNumId != null && numId != currentNumId)
@@ -3046,6 +3050,9 @@ public partial class WordHandler
                     currentListLevel = ilvl;
                     prevOoxmlIlvl = ilvlOoxml;
                     currentNumId = numId;
+                    // Keep the shared state's active num in step so a table-cell
+                    // list after this body list sees the switch (EnterOrderedNum).
+                    olState.CurrentNumId = numId;
                     sb.Append("<li");
                     sb.Append($" data-path=\"/body/p[{wParaCount}]\"");
                     // Marker class wires up the ::marker rule emitted by
@@ -3194,31 +3201,20 @@ public partial class WordHandler
                     var hNumPr = IsNumberingSuppressed(para) ? null : ResolveNumPrFromStyle(para);
                     if (hNumPr is { } hn)
                     {
-                        headingCounters[hn.Ilvl] = headingCounters.GetValueOrDefault(hn.Ilvl, 0) + 1;
-                        // Reset deeper level counters whenever a shallower heading ticks.
-                        for (int lk = hn.Ilvl + 1; lk <= 8; lk++)
-                            if (headingCounters.ContainsKey(lk)) headingCounters[lk] = 0;
+                        // A style-numbered heading is an item of its list like
+                        // any other: advance the SHARED ordered-list state so a
+                        // later list paragraph on the same abstractNum sees the
+                        // level-0 count the headings reached ("3.9", not "1.9"),
+                        // exactly as the text walker already does.
+                        var hAbsId = GetAbstractNumId(hn.NumId);
+                        EnterOrderedNum(olState, hn.NumId);
+                        AdvanceOrderedCounter(olState, hn.NumId, hAbsId, hn.Ilvl);
+                        olState.CurrentNumId = hn.NumId;
 
                         var lvlText = GetLevelText(hn.NumId, hn.Ilvl);
                         if (!string.IsNullOrEmpty(lvlText))
                         {
-                            // Only %1..%9 are valid Word level placeholders.
-                            // Match the RenderOrderedMarker hardening: restrict
-                            // to %1-%9 (so %0 / %x stays literal) and emit ""
-                            // for a placeholder whose fmt resolves to "bullet"
-                            // or an undefined level — otherwise a heading number
-                            // gets polluted with a • glyph and diverges from
-                            // view text. See WordHandler.StyleList.cs
-                            // RenderOrderedMarker.
-                            var numStr = System.Text.RegularExpressions.Regex.Replace(lvlText, @"%([1-9])", m =>
-                            {
-                                var lk = int.Parse(m.Groups[1].Value) - 1;
-                                var lvlFmt = GetNumberingFormat(hn.NumId, lk);
-                                if (lvlFmt.Equals("bullet", StringComparison.OrdinalIgnoreCase))
-                                    return "";
-                                var counter = headingCounters.GetValueOrDefault(lk, 0);
-                                return OfficeCli.Core.WordNumFmtRenderer.Render(counter, lvlFmt);
-                            });
+                            var numStr = RenderOrderedMarker(olState, hn.NumId, hn.Ilvl, lvlText);
                             // Skip the auto-num span when the paragraph text
                             // already begins with the computed number, so a
                             // user-typed "1. Overview" does not render as

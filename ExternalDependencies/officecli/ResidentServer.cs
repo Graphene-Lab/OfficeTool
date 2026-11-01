@@ -210,8 +210,25 @@ public class ResidentServer : IDisposable
     // PromoteToEditable(); the promotion is sticky for the resident's
     // lifetime, matching the pre-existing reopen pattern used by
     // view-screenshot/page-count/refresh.
+    // When this resident started — written into the dirty marker so a later
+    // reader can tell a dead owner from a reused pid.
+    private readonly DateTime _startedUtc = DateTime.UtcNow;
+
+    /// <summary>
+    /// Single writer for <see cref="_dirty"/>: the clean→dirty edge writes the
+    /// on-disk marker, every clean edge removes it (issue #328).
+    /// </summary>
+    private void SetDirty(bool dirty)
+    {
+        var was = _dirty;
+        _dirty = dirty;
+        if (dirty && !was) ResidentDirtyMarker.Write(_filePath, _startedUtc);
+        else if (!dirty && was) ResidentDirtyMarker.Clear(_filePath);
+    }
+
     public ResidentServer(string filePath, bool editable = false)
     {
+        ResidentDirtyMarker.SweepStale();
         _filePath = Path.GetFullPath(filePath);
         _pipeName = GetPipeName(_filePath);
         _editable = editable;
@@ -513,7 +530,7 @@ public class ResidentServer : IDisposable
             }
             else
             {
-                _dirty = false;
+                SetDirty(false);
                 LogStderr($"Autosaved {Path.GetFileName(_filePath)} (idle flush, resident still running).");
             }
         }
@@ -604,7 +621,11 @@ public class ResidentServer : IDisposable
 
             if (request.Command == "__ping__")
             {
-                var response = MakeResponse(0, _filePath, "");
+                // The ack carries this resident's binary version so a client built
+                // from a newer binary (after an in-place auto-update) retires it
+                // instead of talking to a process whose bundle was replaced
+                // underneath it (issue #489).
+                var response = MakeResponse(0, _filePath, Core.UpdateChecker.GetCurrentVersionPublic() ?? "");
                 await WriteLineToPipeAsync(accepted, response, token);
                 return;
             }
@@ -756,7 +777,13 @@ public class ResidentServer : IDisposable
 
     private string ProcessRequest(string requestLine)
     {
+        // Per-request verdict state. Cleared on entry, not after the command:
+        // a request that set it and then aborted (e.g. the each-mode flush
+        // threw) must not hand its exit code to the next request.
+        _lastCommandExitCode = null;
+        _lastRawMutationHadValidationCaveats = false;
         ResidentRequest? request = null;
+        StringWriter? capturedErr = null; // the command's stderr, kept for the error path
         try
         {
             request = System.Text.Json.JsonSerializer.Deserialize<ResidentRequest>(requestLine, ResidentJsonContext.Default.ResidentRequest);
@@ -766,6 +793,7 @@ public class ResidentServer : IDisposable
             // Capture stdout/stderr (safe: _commandLock serializes all commands)
             var stdoutWriter = new StringWriter();
             var stderrWriter = new StringWriter();
+            capturedErr = stderrWriter;
             var origOut = Console.Out;
             var origErr = Console.Error;
             Console.SetOut(stdoutWriter);
@@ -782,6 +810,10 @@ public class ResidentServer : IDisposable
                 _startupStderr = null;
             }
 
+            // --json: collect handler warnings (code + suggestion) exactly as
+            // the CLI front-end does, instead of lifting stderr lines.
+            List<CliWarning>? contextWarnings = null;
+            if (request.Json) OfficeCli.Core.WarningContext.Begin();
             try
             {
                 ExecuteCommand(request);
@@ -797,7 +829,7 @@ public class ResidentServer : IDisposable
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     _handler.Save();
                     sw.Stop();
-                    _dirty = false;
+                    SetDirty(false);
                     RecordSaveDuration(sw.Elapsed);
                 }
             }
@@ -805,6 +837,11 @@ public class ResidentServer : IDisposable
             {
                 Console.SetOut(origOut);
                 Console.SetError(origErr);
+                // Warnings a command queued but did not wrap itself (add, remove,
+                // move, swap print plain text) are merged into the envelope built
+                // below; a command that wrapped its own envelope has already
+                // drained them.
+                contextWarnings = OfficeCli.Core.WarningContext.End();
             }
 
             var stdout = stdoutWriter.ToString().TrimEnd('\r', '\n');
@@ -817,6 +854,15 @@ public class ResidentServer : IDisposable
             // _lastBatchHadFailure; promote it to a non-zero exit here.
             var isBatch = request.Command.Equals("batch", StringComparison.OrdinalIgnoreCase);
             var batchFailure = isBatch && _lastBatchHadFailure;
+
+            // A failed refresh writes its reason to stderr and returns; the
+            // generic stderr inspection below finds no token in it, so text
+            // mode used to answer exit 0 for a refresh that did not happen.
+            // ExecuteRefresh records the verdict in _lastRefreshFailed (reset
+            // at the start of every refresh), so both modes agree with the
+            // one-shot path — see the field's declaration.
+            var isRefresh = request.Command.Equals("refresh", StringComparison.OrdinalIgnoreCase);
+            var refreshFailure = isRefresh && _lastRefreshFailed;
 
             // BUG-INTERVIEW-EDIT-R2: batch text-mode envelope is written by
             // the client via Console.Write (not WriteLine) to avoid double-
@@ -832,13 +878,26 @@ public class ResidentServer : IDisposable
             var isValidate = request.Command.Equals("validate", StringComparison.OrdinalIgnoreCase);
             var validateFailure = isValidate && _lastValidateErrorCount > 0;
             if (isValidate) _lastValidateErrorCount = 0;
+            // raw-set / add-part applied but introduced validator errors:
+            // "applied with caveats" → exit 2, alongside UNSUPPORTED. Read and
+            // clear per request so a caveat never leaks into the next command.
+            var rawCaveats = _lastRawMutationHadValidationCaveats;
+            _lastRawMutationHadValidationCaveats = false;
+            var coreCaveats = _lastCommandExitCode == 2;
+            _lastCommandExitCode = null;
 
             if (request.Json)
             {
                 // JSON mode: server builds the envelope so client just passes through
                 var warnings = BuildWarnings(stderr);
+                if (contextWarnings is { Count: > 0 })
+                {
+                    warnings ??= new List<CliWarning>();
+                    warnings.AddRange(contextWarnings);
+                }
                 var isFailure = string.IsNullOrEmpty(stdout) && warnings is { Count: > 0 }
-                    || stdout.StartsWith("No properties applied", StringComparison.Ordinal);
+                    || stdout.StartsWith("No properties applied", StringComparison.Ordinal)
+                    || stdout.StartsWith("Error: No properties applied", StringComparison.Ordinal);
                 // JSON Envelope contract: propagate judgment-command verdicts
                 // (batch / validate) into envelope.success so it agrees with
                 // exit code on line below. Without this the resident path
@@ -879,24 +938,24 @@ public class ResidentServer : IDisposable
                 // something was applied when nothing was. Single-command
                 // marker precedence (all-unsupported set → 2) is unchanged.
                 int jsonExitCode = 0;
-                if (batchFailure || validateFailure)
+                if (batchFailure || validateFailure || refreshFailure)
                     jsonExitCode = 1;
-                else if (stderr.Contains("UNSUPPORTED") || stderr.Contains(UnrecognizedLatexMarker))
+                else if (coreCaveats || rawCaveats || stderr.Contains("UNSUPPORTED") || stderr.Contains(UnrecognizedLatexMarker))
                     jsonExitCode = 2;
-                else if (!EnvelopeSuccess(envelope) || stderr.Contains("VALIDATION:"))
+                else if (!EnvelopeSuccess(envelope))
                     jsonExitCode = 1;
                 return MakeResponse(jsonExitCode, envelope, "");
             }
 
-            // BUG-DUMP12-01: surface stderr "VALIDATION:" token (emitted by
-            // ExecuteRawSet / ExecuteAddPart when the SDK validator gains new
-            // errors) as exit 1 so callers can detect rejected raw mutations.
-            // Batch/validate verdict failures outrank applied-with-caveats
-            // markers (mirrors the non-resident batch path); single-command
-            // marker precedence is unchanged.
-            int exitCode = (batchFailure || validateFailure) ? 1
-                : ((stderr.Contains("UNSUPPORTED") || stderr.Contains(UnrecognizedLatexMarker)) ? 2
-                : (stderr.Contains("VALIDATION:") ? 1 : 0));
+            // Text mode: batch/validate verdict failures (1) outrank the
+            // applied-with-caveats markers (2): UNSUPPORTED, unrecognized
+            // LaTeX, and a raw-set / add-part that introduced validator
+            // errors (rawCaveats — the mutation is applied, see
+            // ReportRawMutationOutcome; exit 1 here made callers retry and
+            // duplicate content, issue #374).
+            int exitCode = (batchFailure || validateFailure || refreshFailure) ? 1
+                : ((coreCaveats || rawCaveats || stderr.Contains("UNSUPPORTED") || stderr.Contains(UnrecognizedLatexMarker)) ? 2
+                : 0);
             return MakeResponse(exitCode, stdout, stderr);
         }
         catch (Exception ex)
@@ -910,6 +969,23 @@ public class ResidentServer : IDisposable
                     $"Malformed XML in document part: {xe.Message} " +
                     $"(the file appears to have a corrupted OOXML part).", xe)
                 : ex;
+            // A part that failed to parse leaves the SDK package in a half-loaded
+            // state: every later command on this resident then failed with an
+            // unrelated "Specified argument was out of the range (Parameter 'id')"
+            // instead of the corruption message the direct path gives each time.
+            // Reload the document from disk so each command reports the real
+            // error; skipped when unsaved edits would be lost.
+            if (ex is System.Xml.XmlException && !_dirty)
+            {
+                try { _handler.Dispose(); } catch { /* already unusable */ }
+                try { _handler = OfficeCli.Handlers.DocumentHandlerFactory.Open(_filePath, _editable); }
+                catch
+                {
+                    // The file may be gone or unreadable right now: retry on the
+                    // next command instead of serving a disposed handler forever.
+                    _handlerNeedsReopen = true;
+                }
+            }
             if (request?.Json == true)
             {
                 // JSON mode: wrap error in envelope
@@ -920,7 +996,11 @@ public class ResidentServer : IDisposable
             // non-resident CLI path (WriteError in Program.cs). Without
             // this, clients diffing stderr across modes would mis-detect
             // failures.
-            return MakeResponse(1, "", $"Error: {OfficeCli.Core.MsysPathHint.AugmentMessage(rendered.Message)}");
+            // Keep what the command had already written to stderr (e.g. a
+            // selector warning) ahead of the error, as the direct path does.
+            var priorErr = capturedErr?.ToString().TrimEnd('\r', '\n') ?? "";
+            var errLine = $"Error: {OfficeCli.Core.MsysPathHint.AugmentMessage(rendered.Message)}";
+            return MakeResponse(1, "", priorErr.Length > 0 ? priorErr + "\n" + errLine : errLine);
         }
     }
 
@@ -979,6 +1059,10 @@ public class ResidentServer : IDisposable
     {
         try
         {
+            // Nothing to merge: forward the sub-command's envelope byte for byte.
+            // Re-serialising it escaped every non-ASCII character and apostrophe
+            // (\u2190, \u0027) that the direct path emits verbatim.
+            if (!forceFailure && extraWarnings is not { Count: > 0 }) return envelopeJson;
             var node = System.Text.Json.Nodes.JsonNode.Parse(envelopeJson);
             if (node is not System.Text.Json.Nodes.JsonObject obj) return envelopeJson;
             if (forceFailure) obj["success"] = false;
@@ -994,7 +1078,7 @@ public class ResidentServer : IDisposable
                     obj["warnings"] = System.Text.Json.JsonSerializer.SerializeToNode(extraWarnings, AppJsonContext.Default.ListCliWarning);
                 }
             }
-            return obj.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true });
+            return obj.ToJsonString(OutputFormatter.PublicJsonOptions);
         }
         catch
         {
@@ -1002,7 +1086,7 @@ public class ResidentServer : IDisposable
         }
     }
 
-    private static List<CliWarning>? BuildWarnings(string stderr)
+    internal static List<CliWarning>? BuildWarnings(string stderr)
     {
         if (string.IsNullOrEmpty(stderr)) return null;
         var lines = stderr.Split('\n', StringSplitOptions.RemoveEmptyEntries);
@@ -1071,12 +1155,21 @@ public class ResidentServer : IDisposable
         // Mark the in-memory DOM as having unflushed changes. Cleared by the
         // next save/close/idle-autosave. Set here (the shared mutation prelude)
         // so single commands and batch alike are tracked.
-        _dirty = true;
+        SetDirty(true);
     }
+
+    // Set when a reload after a corrupt-part error could not reopen the file;
+    // the next command retries the open (and reports its error if it fails).
+    private bool _handlerNeedsReopen;
 
     private void ExecuteCommand(ResidentRequest request)
     {
         var format = request.Json ? OutputFormat.Json : OutputFormat.Text;
+        if (_handlerNeedsReopen)
+        {
+            _handler = OfficeCli.Handlers.DocumentHandlerFactory.Open(_filePath, _editable);
+            _handlerNeedsReopen = false;
+        }
 
         switch (request.Command)
         {
@@ -1090,6 +1183,10 @@ public class ResidentServer : IDisposable
                 ExecuteQuery(request, format);
                 break;
             case "set":
+                // Reject missing Excel sheets before promotion latches _dirty;
+                // otherwise save/idle-autosave can rewrite an untouched file.
+                if (_handler is ExcelHandler excel)
+                    excel.ValidateSetSheet(request.GetArg("path"));
                 PromoteToEditable();
                 ExecuteSet(request);
                 NotifyWatchSlideChanged(request.GetArg("path"));
@@ -1172,6 +1269,10 @@ public class ResidentServer : IDisposable
                 throw new InvalidOperationException($"Unknown command: {request.Command}");
         }
     }
+
+    // Exit code decided by a shared command core (RunSet: 2 = applied with
+    // unsupported props / unrecognised LaTeX). Consumed once per request.
+    private int? _lastCommandExitCode;
 
     // BUG-R40-B10: track whether the most recent ExecuteBatch saw any
     // failures so ProcessRequest can surface a non-zero exit code.
@@ -1266,7 +1367,7 @@ public class ResidentServer : IDisposable
             var swBarrier = System.Diagnostics.Stopwatch.StartNew();
             _handler.Save();
             swBarrier.Stop();
-            _dirty = false;
+            SetDirty(false);
             RecordSaveDuration(swBarrier.Elapsed);
         }
         if (hasMutating) PromoteToEditable();
@@ -1338,7 +1439,7 @@ public class ResidentServer : IDisposable
                 wh2.DeferSave = true;
                 wh2.AdoptPendingWholeParts(preBatchWholeParts);
             }
-            _dirty = false;
+            SetDirty(false);
             rolledBack = true;
         }
 
@@ -1360,12 +1461,9 @@ public class ResidentServer : IDisposable
         // envelope.success / exit code in lockstep with the non-resident
         // path.
         _lastBatchHadFailure = anyFailed;
-        CommandBuilder.PrintBatchResults(results, json, items.Count, atomicRolledBack: rolledBack);
-        // BUG-BT2: emit the collected unrecognized-LaTeX markers so the
-        // dispatcher maps them to exit 2 and the envelope warning code, exactly
-        // as the single-shot resident add/set path (EmitUnrecognizedLatex) does.
-        foreach (var tok in batchUnrecognizedLatex)
-            Console.Error.WriteLine($"  WARNING: {UnrecognizedLatexMarker} {tok}");
+        // Results, envelope, warnings and exit code are the front-end's
+        // (CommandBuilder.FinishBatch); the resident only records the code.
+        _lastCommandExitCode = CommandBuilder.FinishBatch(results, items.Count, json, batchUnrecognizedLatex, rolledBack);
 
         // Notify any live watch session so the preview reflects the batch.
         // Single add/set/move/remove/etc. each call a NotifyWatch* helper in
@@ -1481,467 +1579,53 @@ public class ResidentServer : IDisposable
 
     private void ExecuteView(ResidentRequest req, OutputFormat format)
     {
-        var mode = req.GetArg("mode", "text")!;
-        var start = req.GetIntArg("start");
-        var end = req.GetIntArg("end");
-        var maxLines = req.GetIntArg("max-lines");
-        // Resident parity with CLI front-end: reject typos / unknown subtypes
-        // here too so a `--type foo` call doesn't get a silent count:0 just
-        // because the request came over the pipe instead of through argv.
-        // Validate also trims and normalises empty/whitespace to null.
-        var issueType = OfficeCli.Core.IssueSubtypes.Validate(req.GetArgOrNull("type"));
-        var limit = req.GetIntArg("limit");
-        var cols = req.GetCols("cols");
-        var pageFilter = req.GetArgOrNull("page");
-
-        if (mode!.ToLowerInvariant() is "html" or "h")
+        // The command itself lives in CommandBuilder.RunView, shared with the
+        // CLI front-end; this method only maps the request to ViewArgs and
+        // supplies the write-lock release/reopen a native render needs.
+        var browser = req.GetArgOrNull("browser");
+        var args = new ViewArgs(
+            Mode: req.GetArg("mode", "text")!,
+            Start: req.GetIntArg("start"),
+            End: req.GetIntArg("end"),
+            MaxLines: req.GetIntArg("max-lines"),
+            // Resident parity with the CLI front-end: reject typos / unknown
+            // subtypes here too (Validate also normalises empty to null).
+            IssueType: OfficeCli.Core.IssueSubtypes.Validate(req.GetArgOrNull("type")),
+            Limit: req.GetIntArg("limit"),
+            ColsStr: req.GetArgOrNull("cols"),
+            PageFilter: req.GetArgOrNull("page"),
+            Browser: browser != null && (browser == "true" || browser == "1"),
+            OutArg: req.GetArgOrNull("out"),
+            ClipArg: req.GetArgOrNull("range"),
+            ScreenshotWidth: req.GetIntArg("screenshot-width") ?? 1600,
+            ScreenshotHeight: req.GetIntArg("screenshot-height") ?? 1200,
+            GridCols: req.GetIntArg("grid") ?? 0,
+            RenderMode: (req.GetArgOrNull("render") ?? "auto").ToLowerInvariant(),
+            WithPages: req.GetArgOrNull("page-count") == "true",
+            Json: req.Json);
+        var nativeLock = new NativeRenderLock
         {
-            string? html = null;
-            if (_handler is OfficeCli.Handlers.PowerPointHandler pptHandler)
-            {
-                // BUG-R36-B7: honor --page on pptx html with strict bounds.
-                var (pStart, pEnd) = ResolvePptHtmlPage(pageFilter, start, end, pptHandler);
-                html = CommandBuilder.RenderViaRegistry(_handler, "pptx",
-                    new OfficeCli.Core.Rendering.RenderOptions { StartPage = pStart, EndPage = pEnd });
-            }
-            else if (_handler is OfficeCli.Handlers.ExcelHandler)
-                html = CommandBuilder.RenderViaRegistry(_handler, "xlsx", new OfficeCli.Core.Rendering.RenderOptions());
-            else if (_handler is OfficeCli.Handlers.WordHandler)
-                html = CommandBuilder.RenderViaRegistry(_handler, "docx",
-                    new OfficeCli.Core.Rendering.RenderOptions { PageFilter = pageFilter });
-            else if (_handler is OfficeCli.Core.Plugins.FormatHandlerProxy proxy)
-                html = proxy.ViewAsHtml(int.TryParse(pageFilter, out var pp) ? pp : (int?)null);
-
-            if (html != null)
-            {
-                // CONSISTENCY(view-html-stdout): mirror CommandBuilder.View.cs — default
-                // mode writes HTML to stdout so `officecli view file html > out.html`
-                // captures actual content. --out writes to the requested path; --browser
-                // writes a temp file (or --out, if given) and opens it.
-                var browser = req.GetArgOrNull("browser");
-                var wantBrowser = browser != null && (browser == "true" || browser == "1");
-                var outArg = req.GetArgOrNull("out");
-                if (outArg != null || wantBrowser)
-                {
-                    // SECURITY: when falling back to a temp file, include a random token so
-                    // the preview path is not predictable. Without it, a predictable path
-                    // enables a symlink pre-placement attack that causes File.WriteAllText
-                    // to clobber an arbitrary victim file. See CommandBuilder.View.cs for
-                    // the same fix.
-                    var htmlPath = outArg ?? Path.Combine(Path.GetTempPath(), $"officecli_preview_{Path.GetFileNameWithoutExtension(_filePath)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.html");
-                    File.WriteAllText(htmlPath, html);
-                    Console.WriteLine(Path.GetFullPath(htmlPath));
-                    if (wantBrowser)
-                    {
-                        try
-                        {
-                            var psi = new System.Diagnostics.ProcessStartInfo(htmlPath) { UseShellExecute = true };
-                            System.Diagnostics.Process.Start(psi);
-                        }
-                        catch { /* silently ignore if browser can't be opened */ }
-                    }
-                }
-                else
-                {
-                    Console.Write(html);
-                }
-            }
-            else
-            {
-                Console.Error.WriteLine("HTML preview is only supported for .pptx, .xlsx, and .docx files.");
-            }
-            return;
-        }
-
-        if (mode!.ToLowerInvariant() is "screenshot" or "p")
-        {
-            string? html = null;
-            byte[]? directPng = null;
-            var gridCols = req.GetIntArg("grid") ?? 0;
-            var renderMode = (req.GetArgOrNull("render") ?? "auto").ToLowerInvariant();
-            // --range clips a data-path region out of the HTML preview — mirrors
-            // CommandBuilder.View.cs: native/direct-PNG backends are bypassed.
-            var rangeArg = req.GetArgOrNull("range");
-            if (rangeArg != null) renderMode = "html";
-            var sw = req.GetIntArg("screenshot-width") ?? 1600;
-            var sh = req.GetIntArg("screenshot-height") ?? 1200;
-            // CONSISTENCY(screenshot-default-first-page): mirror CommandBuilder.View.cs —
-            // screenshot mode defaults to a single bounded visual unit (pptx → slide 1,
-            // docx → page 1, xlsx → active sheet via CSS). Without this, multi-page docs
-            // render the full HTML stacked vertically and get silently cropped by the
-            // viewport height. Caller can opt into more via --page / --grid.
-            if (_handler is OfficeCli.Handlers.PowerPointHandler pptShotHandler)
-            {
-                var effectiveFilter = pageFilter;
-                if (rangeArg != null && string.IsNullOrEmpty(effectiveFilter)
-                    && System.Text.RegularExpressions.Regex.Match(rangeArg, @"^/slide\[(\d+)\]") is { Success: true } slideM)
-                    effectiveFilter = slideM.Groups[1].Value;
-                if (string.IsNullOrEmpty(effectiveFilter) && start is null && end is null && gridCols == 0)
-                    effectiveFilter = "1";
-                var (pStart, pEnd) = ResolvePptHtmlPage(effectiveFilter, start, end, pptShotHandler);
-
-                // Native-first (mirrors docx --render auto/native/html): export the
-                // slide(s) to PNG with the OS-native engine on Windows; grid is HTML-only.
-                // Default export size is the slide's 96-DPI native pixels; a custom
-                // --screenshot-width overrides it (aspect-matched height).
-                var (nativeW, nativeH) = pptShotHandler.GetSlideNativePixels();
-                int exportW = nativeW, exportH = nativeH;
-                if (!(sw == 1600 && sh == 1200))
-                {
-                    exportW = sw;
-                    exportH = sh == 1200 ? Math.Max(1, (int)Math.Round(sw * (double)nativeH / nativeW)) : sh;
-                }
-                // -1 = auto: pick columns from slide count + aspect (mirrors CLI).
-                // Resolved BEFORE the native block's dispose so GetSlideCount is safe,
-                // and used by both the native and HTML paths.
-                int pptGridCols = gridCols < 0
-                    ? OfficeCli.Core.HtmlScreenshot.AutoGridColumns((pEnd ?? pptShotHandler.GetSlideCount()) - (pStart ?? 1) + 1, nativeW, nativeH)
-                    : gridCols;
-                if (renderMode != "html" && OperatingSystem.IsWindows())
-                {
-                    // A read-only handler holds only read access with FileShare.ReadWrite,
-                    // so the app can open the file for read concurrently — no dispose
-                    // needed. An editable handler holds a write handle that blocks the
-                    // app, so release it first (Dispose flushes pending edits) and reopen.
-                    // Grid cell size + slide count are resolved BEFORE any dispose so the
-                    // count read doesn't touch a disposed handler.
-                    var ps = pStart ?? 1;
-                    int gGap = 12, gPad = 12, gCellW = 0, gCellH = 0, gEnd = 0;
-                    if (pptGridCols > 0)
-                    {
-                        gCellW = Math.Max(1, (int)Math.Round((sw - 2 * gPad - (pptGridCols - 1) * gGap) / (double)pptGridCols));
-                        gCellH = Math.Max(1, (int)Math.Round(gCellW * (double)nativeH / nativeW));
-                        gEnd = pEnd ?? pptShotHandler.GetSlideCount();
-                    }
-                    if (_editable) _handler.Dispose();
-                    try
-                    {
-                        directPng = pptGridCols > 0
-                            ? OfficeCli.Core.PowerPointPngBackend.RenderGrid(_filePath, ps, gEnd, gCellW, gCellH, pptGridCols, gGap, gPad)
-                            : OfficeCli.Core.PowerPointPngBackend.Render(_filePath, ps, pEnd ?? ps, exportW, exportH);
-                    }
-                    catch { directPng = null; }
-                    if (_editable)
-                    {
-                        _handler = OfficeCli.Handlers.DocumentHandlerFactory.Open(_filePath, _editable);
-                        pptShotHandler = (OfficeCli.Handlers.PowerPointHandler)_handler;
-                    }
-                }
-                if (renderMode == "native" && directPng == null)
-                {
-                    Console.Error.WriteLine("--render native requires Windows with Microsoft PowerPoint installed.");
-                    return;
-                }
-                if (directPng == null)
-                {
-                    html = CommandBuilder.RenderViaRegistry(pptShotHandler, "pptx", new OfficeCli.Core.Rendering.RenderOptions
-                    { StartPage = pStart, EndPage = pEnd, GridColumns = pptGridCols, ViewportPx = sw })!;
-                    // Single slide: size the viewport to the slide's 96-DPI native
-                    // pixels so the PNG is the slide, padding-free.
-                    if (pStart == pEnd && gridCols == 0)
-                    {
-                        if (sw == 1600 && sh == 1200) { sw = nativeW; sh = nativeH; }
-                        else if (sh == 1200) sh = Math.Max(1, (int)Math.Round(sw * (double)nativeH / nativeW));
-                    }
-                }
-            }
-            else if (_handler is OfficeCli.Handlers.ExcelHandler excelShotHandler)
-                html = CommandBuilder.RenderViaRegistry(excelShotHandler, "xlsx", new OfficeCli.Core.Rendering.RenderOptions())!;
-            else if (_handler is OfficeCli.Handlers.WordHandler wordShotGrid && gridCols != 0)
-            {
-                // Contact-sheet grid — mirrors CommandBuilder.View.cs's docx grid
-                // branch (native-first on Windows, HTML fallback; incl. -1 = auto).
-                const int gGap = 12, gPad = 12, gMaxDim = 1920, gScrollbar = 17;
-                var (gNpW, gNpH) = wordShotGrid.GetPageNativePixels();
-                int gPageCount = 1;
-                var gTmp = Path.Combine(Path.GetTempPath(), $"officecli_gridcount_{Path.GetFileNameWithoutExtension(_filePath)}_{Guid.NewGuid():N}.html");
-                try
-                {
-                    File.WriteAllText(gTmp, CommandBuilder.RenderViaRegistry(wordShotGrid, "docx", new OfficeCli.Core.Rendering.RenderOptions())!);
-                    gPageCount = OfficeCli.Core.HtmlScreenshot.GetPageCountFromDom(gTmp) ?? 1;
-                }
-                catch { /* fall back to 1 row */ }
-                finally { try { File.Delete(gTmp); } catch { /* ignore */ } }
-
-                int gCols = gridCols < 0 ? OfficeCli.Core.HtmlScreenshot.AutoGridColumns(gPageCount, gNpW, gNpH) : gridCols;
-                int gRows = Math.Max(1, (gPageCount + gCols - 1) / gCols);
-                double gVpW = sw;
-                double gCellW = Math.Max(1.0, (gVpW - gScrollbar - gPad * 2.0 - (gCols - 1) * gGap) / gCols);
-                double gCellH = gCellW * gNpH / gNpW;
-                double gVpH = gPad * 2 + gRows * gCellH + (gRows - 1) * gGap;
-                double gOver = Math.Max(gVpW, gVpH) / gMaxDim;
-                if (gOver > 1.0) { gVpW /= gOver; gCellW /= gOver; gCellH /= gOver; gVpH /= gOver; }
-
-                // Native-first on Windows: release an editable write lock (blocks
-                // Word) before rendering, then reopen — same dance as the single-page
-                // branch below.
-                if (renderMode != "html" && OperatingSystem.IsWindows())
-                {
-                    if (_editable) _handler.Dispose();
-                    try { directPng = OfficeCli.Core.WordPdfBackend.RenderGrid(_filePath, $"1-{gPageCount}", (int)Math.Round(gCellW), (int)Math.Round(gCellH), gCols, gGap, gPad); }
-                    catch { directPng = null; }
-                    if (_editable)
-                    {
-                        _handler = OfficeCli.Handlers.DocumentHandlerFactory.Open(_filePath, _editable);
-                        wordShotGrid = (OfficeCli.Handlers.WordHandler)_handler;
-                    }
-                }
-                if (renderMode == "native" && directPng == null)
-                {
-                    Console.Error.WriteLine("--render native requires Windows with Microsoft Word installed.");
-                    return;
-                }
-                if (directPng == null)
-                {
-                    html = CommandBuilder.RenderViaRegistry(wordShotGrid, "docx", new OfficeCli.Core.Rendering.RenderOptions
-                    { GridColumns = gCols, GridCellWidthPx = (int)Math.Round(gCellW) })!;
-                    sw = Math.Max(1, (int)Math.Round(gVpW));
-                    sh = Math.Max(1, (int)Math.Ceiling(gVpH));
-                }
-            }
-            else if (_handler is OfficeCli.Handlers.WordHandler wordShotHandler)
-            {
-                var effectiveFilter = rangeArg != null
-                    ? pageFilter
-                    : (string.IsNullOrEmpty(pageFilter) ? "1" : pageFilter);
-                if (renderMode != "html" && OperatingSystem.IsWindows())
-                {
-                    // See the pptx branch: only an editable handler must be released
-                    // (its write handle blocks Word); a read-only handler coexists.
-                    if (_editable) _handler.Dispose();
-                    // effectiveFilter is only null under --range, which forces
-                    // renderMode=html — this native branch is then unreachable.
-                    try { directPng = OfficeCli.Core.WordPdfBackend.Render(_filePath, effectiveFilter!); } catch { directPng = null; }
-                    if (_editable)
-                    {
-                        _handler = OfficeCli.Handlers.DocumentHandlerFactory.Open(_filePath, _editable);
-                        wordShotHandler = (OfficeCli.Handlers.WordHandler)_handler;
-                    }
-                }
-                if (renderMode == "native" && directPng == null)
-                {
-                    Console.Error.WriteLine("--render native requires Windows with Microsoft Word installed.");
-                    return;
-                }
-                if (directPng == null) html = CommandBuilder.RenderViaRegistry(wordShotHandler, "docx",
-                    new OfficeCli.Core.Rendering.RenderOptions { PageFilter = effectiveFilter })!;
-            }
-            if (html == null && directPng == null)
-            {
-                Console.Error.WriteLine("Screenshot mode is only supported for .pptx, .xlsx, and .docx files.");
-                return;
-            }
-            var pngPath = req.GetArgOrNull("out") ?? Path.Combine(Path.GetTempPath(), $"officecli_screenshot_{Path.GetFileNameWithoutExtension(_filePath)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.png");
-            if (directPng != null)
-            {
-                File.WriteAllBytes(pngPath, directPng);
-            }
-            else
-            {
-                var tmpHtml = Path.Combine(Path.GetTempPath(), $"officecli_preview_{Path.GetFileNameWithoutExtension(_filePath)}_{DateTime.Now:HHmmss}_{Guid.NewGuid():N}.html");
-                File.WriteAllText(tmpHtml, html!);
-                var rs = rangeArg != null
-                    ? OfficeCli.Core.HtmlScreenshot.CaptureClipped(tmpHtml, pngPath,
-                        OfficeCli.Core.HtmlScreenshot.ResolveClipDataPaths(rangeArg))
-                    : OfficeCli.Core.HtmlScreenshot.Capture(tmpHtml, pngPath, sw, sh);
-                try { File.Delete(tmpHtml); } catch { /* ignore */ }
-                if (!rs.Ok)
-                {
-                    Console.Error.WriteLine("No headless browser available. Install Chrome/Edge/Chromium or Firefox, or `pip install playwright && playwright install chromium`."
-                        + (rs.Error != null ? $" Last error: {rs.Error}" : ""));
-                    return;
-                }
-            }
-            Console.WriteLine(Path.GetFullPath(pngPath));
-            if (_handler is OfficeCli.Handlers.PowerPointHandler pptCnt)
-                Console.Error.WriteLine($"[pages] total={pptCnt.GetSlideCount()}");
-            if (req.GetArgOrNull("browser") == "true")
-            {
-                try
-                {
-                    var psi = new System.Diagnostics.ProcessStartInfo(pngPath) { UseShellExecute = true };
-                    System.Diagnostics.Process.Start(psi);
-                }
-                catch { /* silently ignore */ }
-            }
-            return;
-        }
-
-        if (mode!.ToLowerInvariant() is "svg" or "g")
-        {
-            if (_handler is OfficeCli.Handlers.PowerPointHandler pptSvgHandler)
-            {
-                // CONSISTENCY(view-page): SVG mode honors --page like html mode; --page wins over --start.
-                int slideNum = 1;
-                if (!string.IsNullOrEmpty(pageFilter))
-                {
-                    var firstTok = pageFilter.Split(',')[0].Split('-')[0].Trim();
-                    // CONSISTENCY(strict-page): mirror CommandBuilder.View.cs
-                    // — reject non-positive --page values rather than
-                    // silently rendering slide 1.
-                    if (!int.TryParse(firstTok, out var p))
-                        throw new ArgumentException(
-                            $"Invalid --page value '{pageFilter}': expected a positive slide number.");
-                    if (p <= 0)
-                        throw new ArgumentException(
-                            $"Invalid --page value '{pageFilter}': slide number must be >= 1.");
-                    slideNum = p;
-                }
-                else if (start.HasValue && start.Value > 0)
-                {
-                    slideNum = start.Value;
-                }
-                var svg = CommandBuilder.RenderViaRegistry(pptSvgHandler, "pptx",
-                    new OfficeCli.Core.Rendering.RenderOptions
-                    { Output = OfficeCli.Core.Rendering.RenderOutputKind.Svg, StartPage = slideNum })!;
-                Console.Write(svg);
-            }
-            else if (_handler is OfficeCli.Core.Plugins.FormatHandlerProxy svgProxy)
-            {
-                int? svgPage = null;
-                if (!string.IsNullOrEmpty(pageFilter)
-                    && int.TryParse(pageFilter.Split(',')[0].Split('-')[0].Trim(), out var sp))
-                    svgPage = sp;
-                var svg = svgProxy.ViewAsSvg(svgPage);
-                if (svg is null)
-                    Console.Error.WriteLine("SVG preview is not supported by the format-handler plugin.");
-                else
-                    Console.Write(svg);
-            }
-            else
-            {
-                Console.Error.WriteLine("SVG preview is only supported for .pptx files.");
-            }
-            return;
-        }
-
-        int? pageCountValue = null;
-        if (req.GetArgOrNull("page-count") == "true" && (mode!.ToLowerInvariant() is "stats" or "s") && _handler is OfficeCli.Handlers.WordHandler whForCount)
-        {
-            if (OperatingSystem.IsWindows())
-            {
-                _handler.Dispose();
-                try { pageCountValue = OfficeCli.Core.WordPdfBackend.GetPageCount(_filePath); } catch { pageCountValue = null; }
-                _handler = OfficeCli.Handlers.DocumentHandlerFactory.Open(_filePath, _editable);
-                whForCount = (OfficeCli.Handlers.WordHandler)_handler;
-            }
-            if (pageCountValue == null)
-            {
-                var tmpHtml = Path.Combine(Path.GetTempPath(), $"officecli_pc_{Path.GetFileNameWithoutExtension(_filePath)}_{Guid.NewGuid():N}.html");
-                try
-                {
-                    File.WriteAllText(tmpHtml, CommandBuilder.RenderViaRegistry(whForCount, "docx", new OfficeCli.Core.Rendering.RenderOptions())!);
-                    pageCountValue = OfficeCli.Core.HtmlScreenshot.GetPageCountFromDom(tmpHtml);
-                }
-                finally { try { File.Delete(tmpHtml); } catch { } }
-            }
-            if (pageCountValue == null)
-            {
-                Console.Error.WriteLine("--page-count: failed to get page count (Word backend and HTML fallback both unavailable).");
-                return;
-            }
-        }
-
-        if (req.Json)
-        {
-            var modeKey = mode!.ToLowerInvariant();
-            if (modeKey is "stats" or "s")
-            {
-                var statsJson = _handler.ViewAsStatsJson();
-                if (pageCountValue.HasValue) statsJson["pages"] = pageCountValue.Value;
-                Console.WriteLine(statsJson.ToJsonString(OutputFormatter.PublicJsonOptions));
-            }
-            else if (modeKey is "outline" or "o")
-                Console.WriteLine(_handler.ViewAsOutlineJson().ToJsonString(OutputFormatter.PublicJsonOptions));
-            else if (modeKey is "text" or "t")
-                Console.WriteLine(_handler.ViewAsTextJson(start, end, maxLines, cols, req.GetArgOrNull("range")).ToJsonString(OutputFormatter.PublicJsonOptions));
-            else if (modeKey is "annotated" or "a")
-                Console.WriteLine(OutputFormatter.FormatView(mode, _handler.ViewAsAnnotated(start, end, maxLines, cols), format));
-            else if (modeKey is "issues" or "i")
-                Console.WriteLine(OutputFormatter.FormatIssues(_handler.ViewAsIssues(issueType, limit), format));
-            else if (modeKey is "forms" or "f")
-            {
-                if (_handler is OfficeCli.Handlers.WordHandler wordFormsHandler)
-                    Console.WriteLine(wordFormsHandler.ViewAsFormsJson().ToJsonString(OutputFormatter.PublicJsonOptions));
-                else if (_handler is OfficeCli.Core.Plugins.FormatHandlerProxy formsProxy)
-                {
-                    var formsJson = formsProxy.ViewAsFormsJson();
-                    if (formsJson is null)
-                        Console.Error.WriteLine($"Forms view is not supported by the format-handler plugin.");
-                    else
-                        Console.WriteLine(formsJson.ToJsonString(OutputFormatter.PublicJsonOptions));
-                }
-                else
-                    Console.Error.WriteLine("Forms view is only supported for .docx files.");
-            }
-            else
-                // Unknown mode is a caller bug, not a successful view: throw
-                // the same CliException CommandBuilder.View.cs raises in the
-                // direct-mode path so the envelope reports success=false /
-                // code=invalid_value instead of stdout-ing the error message
-                // as the view payload.
-                throw new OfficeCli.Core.CliException($"Unknown mode: {mode}. Available: text, annotated, outline, stats, issues, html, svg, screenshot, forms")
-                {
-                    Code = "invalid_value",
-                    ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot", "pdf", "forms"]
-                };
-        }
-        else
-        {
-            var modeKey = mode!.ToLowerInvariant();
-            string output;
-            switch (modeKey)
-            {
-                case "text" or "t":
-                    output = _handler.ViewAsText(start, end, maxLines, cols, req.GetArgOrNull("range")); break;
-                case "annotated" or "a":
-                    output = _handler.ViewAsAnnotated(start, end, maxLines, cols); break;
-                case "outline" or "o":
-                    output = _handler.ViewAsOutline(); break;
-                case "stats" or "s":
-                    output = pageCountValue.HasValue
-                        ? $"Pages: {pageCountValue}\n" + _handler.ViewAsStats()
-                        : _handler.ViewAsStats(); break;
-                case "issues" or "i":
-                    output = OutputFormatter.FormatIssues(_handler.ViewAsIssues(issueType, limit), format); break;
-                case "forms" or "f":
-                    output = _handler switch
-                    {
-                        OfficeCli.Handlers.WordHandler wfh => wfh.ViewAsForms(),
-                        OfficeCli.Core.Plugins.FormatHandlerProxy fp
-                            => fp.ViewAsFormsJson()?.ToJsonString(OutputFormatter.PublicJsonOptions)
-                               ?? throw new OfficeCli.Core.CliException("Forms view is not supported by the format-handler plugin.")
-                                   { Code = "unsupported_type" },
-                        _ => throw new OfficeCli.Core.CliException("Forms view is only supported for .docx files.")
-                        {
-                            Code = "unsupported_type",
-                            ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot", "pdf", "forms"]
-                        }
-                    };
-                    break;
-                default:
-                    throw new OfficeCli.Core.CliException($"Unknown mode: {mode}. Available: text, annotated, outline, stats, issues, html, svg, screenshot, forms")
-                    {
-                        Code = "invalid_value",
-                        ValidValues = ["text", "annotated", "outline", "stats", "issues", "html", "svg", "screenshot", "pdf", "forms"]
-                    };
-            }
-            Console.WriteLine(output);
-        }
+            // A read-only handler holds only read access with FileShare.ReadWrite,
+            // so the Office app can open the file concurrently; an editable handler
+            // holds a write handle that blocks it, so release and reopen that one.
+            Release = () => { if (_editable) _handler.Dispose(); },
+            Reopen = () => { if (_editable) _handler = OfficeCli.Handlers.DocumentHandlerFactory.Open(_filePath, _editable); return _handler; },
+        };
+        CommandBuilder.RunView(_handler, _filePath, args, nativeLock);
     }
 
     private void ExecuteGet(ResidentRequest req, OutputFormat format)
     {
         var path = req.GetArg("path", "/");
         var depth = req.GetIntArg("depth") ?? 1;
-        var node = _handler.Get(path, depth);
+        var node = CommandBuilder.GetNodeAtDepth(_handler, path, depth);
 
         // CONSISTENCY(get-not-found-exit): mirror CommandBuilder.GetQuery.cs.
         // Some handler Get paths surface "not found" via Type="error" rather
         // than throwing. Convert to a real exception so the resident response
         // exits non-zero, matching the direct-mode CLI behavior.
         if (string.Equals(node.Type, "error", StringComparison.Ordinal))
-            throw new ArgumentException(node.Text ?? $"Path not found: {path}");
+            throw new OfficeCli.Core.CliException(node.Text ?? $"Path not found: {path}") { Code = "not_found" };
 
         // CONSISTENCY(get-save): mirror CommandBuilder.GetQuery.cs lines 59-74.
         // Direct-mode `get --save` extracts the binary payload backing an
@@ -1951,8 +1635,8 @@ public class ResidentServer : IDisposable
         if (!string.IsNullOrEmpty(savePath))
         {
             if (!_handler.TryExtractBinary(path, savePath, out var contentType, out var byteCount))
-                throw new InvalidOperationException(
-                    $"Node at '{path}' has no binary payload to extract (only ole/picture/media/embedded nodes can be saved).");
+                throw new OfficeCli.Core.CliException($"Node at '{path}' has no binary payload to extract (only ole/picture/media/embedded nodes can be saved).")
+                { Code = "unsupported_type", Suggestion = "Point --save at a picture, media, ole or embedded node (see `query picture`)." };
             node.Format["savedTo"] = savePath;
             node.Format["savedBytes"] = byteCount;
             if (!string.IsNullOrEmpty(contentType))
@@ -1966,7 +1650,7 @@ public class ResidentServer : IDisposable
         if (format == OutputFormat.Json)
             Console.WriteLine(OutputFormatter.FormatNodes(new List<DocumentNode> { node }, format));
         else
-            Console.WriteLine(OutputFormatter.FormatNode(node, format));
+            Console.WriteLine(OutputFormatter.FormatNode(node, format).TrimEnd('\r', '\n'));
     }
 
     // BUG-DUMP-R6-01: dump used to bypass the resident and open its own
@@ -2078,7 +1762,8 @@ public class ResidentServer : IDisposable
         // every node — mirror CommandBuilder's batch-query guard.
         var selector = req.GetArgOrNull("selector") ?? req.GetArgOrNull("path") ?? "";
         if (string.IsNullOrEmpty(selector))
-            throw new ArgumentException("'query' requires a selector. Example: {\"command\": \"query\", \"selector\": \"row[Score>80]\"}");
+            throw new OfficeCli.Core.CliException("'query' requires a selector (e.g. paragraph, shape, row[Score>80]).")
+            { Code = "invalid_input", Suggestion = "Run 'officecli query --help' for selector syntax." };
         // CONSISTENCY(cell-selector-alias): mirror the direct-mode normalization +
         // boolean engine in CommandBuilder.GetQuery.cs — without alias normalization,
         // resident-mode Excel cell queries with short aliases (bold, size, ...)
@@ -2102,24 +1787,9 @@ public class ResidentServer : IDisposable
         // CONSISTENCY(query-json-children): hydrate Children from Get(path, depth=1)
         // for JSON output so consumers see the same shape as `get --json`. Mirrors
         // the post-processing in CommandBuilder.GetQuery.cs.
-        if (format == OutputFormat.Json)
-        {
-            foreach (var n in results)
-            {
-                if (n.ChildCount > 0 && n.Children.Count == 0 && !string.IsNullOrEmpty(n.Path))
-                {
-                    try
-                    {
-                        var hydrated = _handler.Get(n.Path, depth: 1);
-                        if (hydrated?.Children != null && hydrated.Children.Count > 0)
-                            n.Children.AddRange(hydrated.Children);
-                    }
-                    catch { /* path may not be Get-resolvable; leave empty */ }
-                }
-            }
-        }
-        foreach (var w in warnings) Console.Error.WriteLine(w.Message);
-        Console.WriteLine(OutputFormatter.FormatNodes(results, format));
+        // Printing (children hydration, envelope with selector warnings,
+        // "No matches" hint) is the front-end's — CommandBuilder.PrintQueryResults.
+        CommandBuilder.PrintQueryResults(_handler, results, warnings, req.Json, Path.GetExtension(_filePath), req.GetArgOrNull("fields"));
     }
 
     private void ExecuteSet(ResidentRequest req)
@@ -2133,133 +1803,11 @@ public class ResidentServer : IDisposable
         // The handler selector branch throws on an empty match, so no silent no-op.
         // Agent-safety: reject a bare unscoped selector (mirrors CommandBuilder).
         OfficeCli.Core.MutationSelectorGuard.EnsureScoped(path, "set");
-        // Shared core: apply + prop-autocorrect + categorise — one copy across
-        // CLI / batch / MCP / resident (CommandBuilder.ApplySetWithCorrection).
-        // This also gives the resident the distance-1 typo auto-correction it
-        // previously lacked, so `set colot=color` behaves the same whether or
-        // not a resident is alive. The resident's own envelope (find-count,
-        // selector-count, watch, overflow, --json wrapping) stays below.
-        // CONSISTENCY(applied-echo): mirrors CommandBuilder.Set.cs — pre/post
-        // Format snapshots feed the " (applied: ...)" normalization echo.
-        var beforeSnap = CommandBuilder.TryGetFormatSnapshot(_handler, path);
-        var (applied, unsupported, autoCorrected) =
-            CommandBuilder.ApplySetWithCorrection(_handler, path, properties);
-
-        // CONSISTENCY(find-match-count): mirrored in CommandBuilder.Set.cs.
-        // The resident path is hit whenever a resident process is open
-        // (which `create` does by default), so both sites must surface
-        // findMatchCount + zero_matches warning identically.
-        int? findMatchCount = null;
-        if (properties.ContainsKey("find"))
-        {
-            findMatchCount = _handler switch
-            {
-                WordHandler wh => wh.LastFindMatchCount,
-                PowerPointHandler ph => ph.LastFindMatchCount,
-                ExcelHandler eh => eh.LastFindMatchCount,
-                _ => null
-            };
-        }
-
-        // CONSISTENCY(selector-set): echo how many elements a multi-match selector
-        // set touched, so a Sheet1!row[工资>5000]-style mutation makes its scope
-        // visible. Single-target paths (count 1) stay quiet.
-        int? selectorCount = null;
-        if (!string.IsNullOrEmpty(path) && !path.StartsWith("/"))
-            selectorCount = _handler switch
-            {
-                WordHandler wh => wh.LastSelectorSetCount,
-                PowerPointHandler ph => ph.LastSelectorSetCount,
-                ExcelHandler eh => eh.LastSelectorSetCount,
-                _ => null
-            };
-
-        // R4-bt-1: report the post-move resolvable path for equation mode
-        // switches (oMathPara ⇄ oMath), consistent with the non-resident path.
-        var reportPath = (_handler as WordHandler)?.LastSetNewPath ?? path;
-        var appliedSuffix = CommandBuilder.BuildAppliedSuffix(applied,
-            beforeSnap, CommandBuilder.TryGetFormatSnapshot(_handler, reportPath));
-        var message = applied.Count > 0
-            ? $"Updated {reportPath}: {string.Join(", ", applied.Select(kv => $"{kv.Key}={kv.Value}"))}"
-              + appliedSuffix
-              + (findMatchCount.HasValue ? $" ({findMatchCount.Value} matched)" : "")
-              + (selectorCount > 1 ? $" ({selectorCount} elements matched)" : "")
-            : (unsupported.Count > 0 ? $"No properties applied to {path}" : $"Updated {path}");
-
-        var warnings = new List<OfficeCli.Core.CliWarning>();
-        foreach (var ac in autoCorrected)
-            warnings.Add(new OfficeCli.Core.CliWarning
-            {
-                Message = $"Auto-corrected '{ac.Original}' to '{ac.Corrected}'",
-                Code = "auto_corrected",
-            });
-        if (findMatchCount is 0)
-        {
-            warnings.Add(new OfficeCli.Core.CliWarning
-            {
-                Message = $"find pattern matched 0 occurrences at {path} — original text may have been edited or the path is wrong",
-                Code = "zero_matches",
-                Suggestion = "verify the path still resolves and the find text is current"
-            });
-        }
-        var overflow = CommandBuilder.CheckTextOverflow(_handler, path);
-        if (overflow != null)
-        {
-            warnings.Add(new OfficeCli.Core.CliWarning
-            {
-                Message = overflow,
-                Code = "text_overflow",
-                Suggestion = "Increase shape height/width, reduce font size, or shorten text"
-            });
-        }
-        if (_handler is WordHandler setWhWarn)
-        {
-            foreach (var w in setWhWarn.LastSetWarnings)
-                warnings.Add(new OfficeCli.Core.CliWarning { Message = w, Code = "advisory" });
-        }
-
-        if (req.Json)
-        {
-            bool allFailed = applied.Count == 0 && unsupported.Count > 0;
-            Console.WriteLine(allFailed
-                ? OutputFormatter.WrapEnvelopeError(message, warnings.Count > 0 ? warnings : null)
-                : OutputFormatter.WrapEnvelopeText(message, warnings.Count > 0 ? warnings : null, findMatchCount));
-        }
-        else
-        {
-            if (applied.Count > 0 || unsupported.Count > 0) Console.WriteLine(message);
-            foreach (var ac in autoCorrected)
-                Console.Error.WriteLine($"WARNING: Auto-corrected '{ac.Original}' to '{ac.Corrected}'");
-            if (findMatchCount is 0)
-                Console.Error.WriteLine($"WARNING: find pattern matched 0 occurrences at {path}");
-            if (overflow != null)
-                Console.Error.WriteLine($"  WARNING: {overflow}");
-            if (_handler is WordHandler setWhWarnPlain)
-            {
-                foreach (var w in setWhWarnPlain.LastSetWarnings)
-                    Console.Error.WriteLine($"  WARNING: {w}");
-            }
-        }
-
-        // Unrecognized LaTeX from an equation Set (formula=). Same emission as
-        // ExecuteAdd — distinctive stderr line drives exit 2 + envelope code.
-        EmitUnrecognizedLatex(_handler);
-
-        if (unsupported.Count > 0)
-        {
-            // /styles/<id> on Word: targeted curated hints, no raw-set push.
-            // See StyleUnsupportedHints + matching branch in CommandBuilder.
-            if (_handler is WordHandler
-                && path.StartsWith("/styles/", StringComparison.Ordinal))
-            {
-                var styleHint = OfficeCli.Core.StyleUnsupportedHints.Format(unsupported);
-                if (styleHint != null) Console.Error.WriteLine(styleHint);
-            }
-            else
-            {
-                Console.Error.WriteLine(FormatUnsupportedLine(unsupported));
-            }
-        }
+        // The command itself is CommandBuilder.RunSet, shared with the CLI
+        // front-end; only the exit-code plumbing is the resident's.
+        var outcome = CommandBuilder.RunSet(_handler, _filePath, path, properties, req.Json,
+            isSelectorSet: !string.IsNullOrEmpty(path) && !path.StartsWith("/"));
+        _lastCommandExitCode = outcome.ExitCode;
     }
 
     // When the handler already attached a parenthetical hint naming the valid
@@ -2404,10 +1952,21 @@ public class ResidentServer : IDisposable
         Console.WriteLine($"Moved to {resultPath}");
     }
 
+    // A refresh that fails reports the failure on stderr and returns — it does
+    // not throw, because the handler is reopened either way and the resident
+    // has to stay usable. None of that text is a token the generic stderr
+    // inspection in ProcessRequest looks for, so text mode answered exit 0 for
+    // a refresh that failed (the one-shot path and the JSON envelope both say
+    // 1). Record the verdict here; ProcessRequest reads it and promotes it to a
+    // non-zero exit, exactly as ExecuteBatch / ExecuteValidate do.
+    private bool _lastRefreshFailed;
+
     private void ExecuteRefresh(ResidentRequest req)
     {
+        _lastRefreshFailed = false;
         if (_handler is not OfficeCli.Handlers.WordHandler)
         {
+            _lastRefreshFailed = true;
             Console.Error.WriteLine("refresh currently only supports .docx files.");
             return;
         }
@@ -2427,6 +1986,7 @@ public class ResidentServer : IDisposable
         _handler = OfficeCli.Handlers.DocumentHandlerFactory.Open(_filePath, _editable);
         if (!ok)
         {
+            _lastRefreshFailed = true;
             Console.Error.WriteLine("refresh failed (Word backend unavailable and HTML fallback failed).");
             return;
         }
@@ -2478,23 +2038,7 @@ public class ResidentServer : IDisposable
 
         var errorsBefore = _handler.Validate().Select(e => e.Description).ToHashSet();
         _handler.RawSet(partPath, xpath, action, xml);
-
-        var errorsAfter = _handler.Validate();
-        var newErrors = errorsAfter.Where(e => !errorsBefore.Contains(e.Description)).ToList();
-        if (newErrors.Count > 0)
-        {
-            // BUG-DUMP12-01: emit VALIDATION report to stderr (not stdout) so the
-            // ProcessRequest exit-code logic — which checks stderr for failure
-            // tokens — promotes the request to a non-zero exit code. Writing to
-            // stdout also corrupted batch --json output (BUG-R5-01 rationale).
-            Console.Error.WriteLine($"VALIDATION: {newErrors.Count} new error(s) introduced:");
-            foreach (var err in newErrors)
-            {
-                Console.Error.WriteLine($"  [{err.ErrorType}] {err.Description}");
-                if (err.Path != null) Console.Error.WriteLine($"    Path: {err.Path}");
-                if (err.Part != null) Console.Error.WriteLine($"    Part: {err.Part}");
-            }
-        }
+        ReportRawMutationOutcome(req, $"raw-set applied: {action} at {xpath}", errorsBefore);
     }
 
     private void ExecuteAddPart(ResidentRequest req)
@@ -2503,23 +2047,38 @@ public class ResidentServer : IDisposable
         var type = req.GetArg("type", "");
         var errorsBefore = _handler.Validate().Select(e => e.Description).ToHashSet();
         var (relId, partPath) = _handler.AddPart(parent, type);
-        Console.WriteLine($"Created {type} part: relId={relId} path={partPath}");
+        ReportRawMutationOutcome(req, $"Created {type} part: relId={relId} path={partPath}", errorsBefore);
+    }
 
-        var errorsAfter = _handler.Validate();
-        var newErrors = errorsAfter.Where(e => !errorsBefore.Contains(e.Description)).ToList();
-        if (newErrors.Count > 0)
+    // Shared tail of raw-set / add-part. Mirrors CommandBuilder.Raw.cs so the
+    // resident and one-shot paths emit the same envelope for the same outcome:
+    // the mutation is APPLIED even when the SDK validator gains new errors
+    // (the validator is advisory — it flags element order Word itself opens
+    // fine — and raw-set is the escape hatch, so it never rolls back). The
+    // caveat rides as validation_error warnings on a success:true envelope
+    // and the request exits 2 ("applied with caveats", the unsupported_property
+    // code). Issue #374: this path used to leave stdout empty and print the
+    // report to stderr, which the dispatcher turned into success:false / exit 1
+    // — a retry signal — so callers re-issued the write and duplicated content.
+    private void ReportRawMutationOutcome(ResidentRequest req, string message, HashSet<string> errorsBefore)
+    {
+        var warnings = CommandBuilder.ReportNewErrorsAsWarnings(_handler, errorsBefore);
+        if (warnings is { Count: > 0 }) _lastRawMutationHadValidationCaveats = true;
+        if (req.Json)
         {
-            // BUG-DUMP12-01: route VALIDATION report to stderr — see ExecuteRawSet
-            // for rationale (mirrors CommandBuilder.ReportNewErrors and lets the
-            // ProcessRequest exit-code logic promote the request to exit 1).
-            Console.Error.WriteLine($"VALIDATION: {newErrors.Count} new error(s) introduced:");
-            foreach (var err in newErrors)
-            {
-                Console.Error.WriteLine($"  [{err.ErrorType}] {err.Description}");
-                if (err.Path != null) Console.Error.WriteLine($"    Path: {err.Path}");
-                if (err.Part != null) Console.Error.WriteLine($"    Part: {err.Part}");
-            }
+            // Full envelope here; nothing on stderr, or the dispatcher's
+            // BuildWarnings would merge a second copy of every line.
+            Console.WriteLine(OutputFormatter.WrapEnvelopeText(message, warnings));
+            return;
         }
+        Console.WriteLine(message);
+        if (warnings is not { Count: > 0 }) return;
+        // Text mode keeps the report on stderr (BUG-DUMP12-01: stdout would
+        // corrupt batch --json output); exit 2 comes from the flag, not from
+        // the dispatcher grepping this text.
+        Console.Error.WriteLine($"VALIDATION: {warnings.Count} new error(s) introduced:");
+        foreach (var w in warnings)
+            Console.Error.WriteLine($"  {w.Message}");
     }
 
     // R7-bt-3 / R7-bt-4: validate exit code & stream destination.
@@ -2530,6 +2089,11 @@ public class ResidentServer : IDisposable
     // to a non-zero exit code, and write the failure report to stderr —
     // mirrors the standard convention for diagnostic / lint tools.
     private int _lastValidateErrorCount;
+
+    // Set by ReportRawMutationOutcome when raw-set / add-part applied but the
+    // SDK validator gained new errors; ProcessRequest reads+clears it and maps
+    // the request to exit 2 (applied with caveats), never 1.
+    private bool _lastRawMutationHadValidationCaveats;
 
     private void ExecuteValidate()
     {
@@ -2576,7 +2140,7 @@ public class ResidentServer : IDisposable
         var sw = System.Diagnostics.Stopwatch.StartNew();
         _handler.Save();
         sw.Stop();
-        _dirty = false;
+        SetDirty(false);
         RecordSaveDuration(sw.Elapsed);
         Console.WriteLine($"Saved {Path.GetFileName(_filePath)}");
     }
@@ -2776,6 +2340,10 @@ public class ResidentServer : IDisposable
             disposeFailed = true;
             LogStderr($"Warning: handler dispose error: {ex.Message}");
         }
+        // The final flush landed (or nothing was pending): the dirty marker
+        // has served its purpose. Left in place only when the flush itself
+        // failed — then the edits really may be gone.
+        if (!disposeFailed) SetDirty(false);
 
         // BUG-BT-R26-2 / BUG-R43: detect data loss. The original probe used
         // File.Exists(_filePath) post-Dispose — but on macOS, renaming the
@@ -2827,36 +2395,6 @@ public class ResidentServer : IDisposable
         catch { }
     }
 
-    /// <summary>
-    /// BUG-R36-B7 helper. Mirror of CommandBuilder.View.ParsePptHtmlPage —
-    /// validate --page against slide count and reject silent fallbacks.
-    /// </summary>
-    private static (int? start, int? end) ResolvePptHtmlPage(
-        string? pageFilter, int? start, int? end,
-        OfficeCli.Handlers.PowerPointHandler pptHandler)
-    {
-        if (string.IsNullOrEmpty(pageFilter)) return (start, end);
-        var slideCount = pptHandler.Query("slide").Count;
-        var firstTok = pageFilter.Split(',')[0].Trim();
-        if (firstTok.Contains('-'))
-        {
-            var parts = firstTok.Split('-', 2);
-            if (!int.TryParse(parts[0], out var ps) || !int.TryParse(parts[1], out var pe))
-                throw new ArgumentException($"Invalid --page value '{pageFilter}': expected N or M-N or comma list.");
-            if (ps <= 0 || pe <= 0)
-                throw new ArgumentException($"Invalid --page value '{pageFilter}': slide number must be >= 1.");
-            if (ps > slideCount)
-                throw new ArgumentException($"--page {ps} out of range (total slides: {slideCount}).");
-            return (ps, Math.Min(pe, slideCount));
-        }
-        if (!int.TryParse(firstTok, out var p))
-            throw new ArgumentException($"Invalid --page value '{pageFilter}': expected a positive slide number.");
-        if (p <= 0)
-            throw new ArgumentException($"Invalid --page value '{pageFilter}': slide number must be >= 1.");
-        if (p > slideCount)
-            throw new ArgumentException($"--page {p} out of range (total slides: {slideCount}).");
-        return (p, p);
-    }
 }
 
 public class ResidentRequest

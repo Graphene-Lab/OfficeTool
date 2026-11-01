@@ -100,6 +100,8 @@ internal class BatchItemConverter : JsonConverter<BatchItem>
                 case "selector": item.Selector = reader.GetString(); break;
                 case "text": item.Text = reader.GetString(); break;
                 case "mode": item.Mode = reader.GetString(); break;
+                case "compact": item.Compact = reader.TokenType == JsonTokenType.Null ? null : reader.GetBoolean(); break;
+                case "fields": item.Fields = reader.GetString(); break;
                 case "depth": item.Depth = reader.TokenType == JsonTokenType.Null ? null : reader.GetInt32(); break;
                 case "part": item.Part = reader.GetString(); break;
                 case "xpath": item.Xpath = reader.GetString(); break;
@@ -129,6 +131,8 @@ internal class BatchItemConverter : JsonConverter<BatchItem>
         if (value.Selector != null) writer.WriteString("selector", value.Selector);
         if (value.Text != null) writer.WriteString("text", value.Text);
         if (value.Mode != null) writer.WriteString("mode", value.Mode);
+        if (value.Compact.HasValue) writer.WriteBoolean("compact", value.Compact.Value);
+        if (value.Fields != null) writer.WriteString("fields", value.Fields);
         if (value.Depth.HasValue) writer.WriteNumber("depth", value.Depth.Value);
         if (value.Part != null) writer.WriteString("part", value.Part);
         if (value.Xpath != null) writer.WriteString("xpath", value.Xpath);
@@ -160,6 +164,22 @@ public class BatchItem
     public string? Selector { get; set; }
     public string? Text { get; set; }
     public string? Mode { get; set; }
+    // Read-output options of the item's own verb, mirroring the CLI flags of
+    // the same name: `query --compact` / `query --fields x,y`. They are
+    // siblings of `selector` for the same reason `selector` is a sibling of
+    // `path`: a read item's arguments are fields, and the verbose form of a
+    // read is what costs a `batch`-only caller its context window (measured on
+    // a two-slide deck: `query placeholder` answers 2365 bytes as a JSON tree
+    // and 205 as compact lines). Absent = the command's own default, so a batch
+    // that sets neither keeps its previous output byte for byte.
+    //
+    // CONSISTENCY(batch-read-options): mirrored by the reader/writer cases
+    // above, KnownFields below, ToResidentRequest, and the `query` case in
+    // ExecuteBatchItem. The verbs that grow more options should extend THIS
+    // list rather than each inventing its own container — see issue #522 and
+    // PR #286 (an `options` object) for the shape that discussion is heading.
+    public bool? Compact { get; set; }
+    public string? Fields { get; set; }
     public int? Depth { get; set; }
     public string? Part { get; set; }
     public string? Xpath { get; set; }
@@ -167,16 +187,18 @@ public class BatchItem
     public string? Xml { get; set; }
     // NEWLINE-SEMANTICS-V2: dumps are versioned via a leading
     // {"command":"meta","dumpVersion":2} item. v2 encodes soft line breaks
-    // as '\v' in text props ('\n' means a paragraph boundary); dumps
-    // WITHOUT a meta item are legacy v1, where '\n' meant a soft break —
-    // BatchCompat rewrites those on replay so old dump files keep restoring
-    // the exact original structure.
+    // as '\v' in text props ('\n' means a paragraph boundary). A batch that
+    // EXPLICITLY declares a version below 2 opts back into the pre-v2 reading
+    // and BatchCompat rewrites its '\n' to '\v' on replay; a batch with NO
+    // meta item follows current semantics, because a hand-written batch
+    // carries no meta either and reading those as legacy made one batch item
+    // behave differently from the identical single command.
     public int? DumpVersion { get; set; }
 
     internal static readonly HashSet<string> KnownFields = new(StringComparer.OrdinalIgnoreCase)
     {
         "command", "op", "path", "parent", "type", "from", "index", "after", "before", "to", "path2",
-        "props", "selector", "text", "mode", "depth", "part", "xpath", "action", "xml", "dumpversion"
+        "props", "selector", "text", "mode", "compact", "fields", "depth", "part", "xpath", "action", "xml", "dumpversion"
     };
 
     public ResidentRequest ToResidentRequest()
@@ -195,6 +217,8 @@ public class BatchItem
         if (Selector != null) req.Args["selector"] = Selector;
         if (Text != null) req.Args["text"] = Text;
         if (Mode != null) req.Args["mode"] = Mode;
+        if (Compact == true) req.Args["compact"] = "true";
+        if (Fields != null) req.Args["fields"] = Fields;
         if (Depth.HasValue) req.Args["depth"] = Depth.Value.ToString();
         if (Part != null) req.Args["part"] = Part;
         if (Xpath != null) req.Args["xpath"] = Xpath;
@@ -223,6 +247,8 @@ public class BatchResult
     public string? Code { get; set; }
     /// <summary>The original batch item, included when the command fails so the agent can inspect/retry.</summary>
     public BatchItem? Item { get; set; }
+    /// <summary>Advisory diagnostics produced while executing this item.</summary>
+    internal List<OfficeCli.Core.CliWarning>? Warnings { get; set; }
 }
 
 /// <summary>
@@ -242,6 +268,8 @@ internal class BatchResultConverter : JsonConverter<BatchResult>
         if (root.TryGetProperty("error", out var err)) result.Error = err.GetString();
         if (root.TryGetProperty("code", out var cod)) result.Code = cod.GetString();
         if (root.TryGetProperty("item", out var itm)) result.Item = JsonSerializer.Deserialize(itm.GetRawText(), BatchJsonContext.Default.BatchItem);
+        if (root.TryGetProperty("warnings", out var wrn))
+            result.Warnings = JsonSerializer.Deserialize(wrn.GetRawText(), OfficeCli.Core.AppJsonContext.Default.ListCliWarning);
         return result;
     }
 
@@ -274,6 +302,11 @@ internal class BatchResultConverter : JsonConverter<BatchResult>
                 writer.WritePropertyName("item");
                 JsonSerializer.Serialize(writer, value.Item, BatchJsonContext.Default.BatchItem);
             }
+        }
+        if (value.Warnings is { Count: > 0 })
+        {
+            writer.WritePropertyName("warnings");
+            JsonSerializer.Serialize(writer, value.Warnings, OfficeCli.Core.AppJsonContext.Default.ListCliWarning);
         }
         writer.WriteEndObject();
     }

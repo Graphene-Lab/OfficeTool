@@ -297,6 +297,65 @@ internal static class ParseHelpers
     };
 
     /// <summary>
+    /// Tolerance used when comparing SpreadsheetML @tint values. Get emits the
+    /// tint rounded to 2 decimal percent, so a replayed `accent1+tint80` has to
+    /// match the 0.79998168889431442 Excel actually wrote — otherwise every
+    /// dump→batch round-trip would append a near-duplicate fill/font.
+    /// Excel's own palette steps are 0.2 apart, so 0.005 cannot collide.
+    /// </summary>
+    public const double ExcelTintEpsilon = 0.005;
+
+    /// <summary>
+    /// Split a scheme color value carrying an optional SpreadsheetML tint
+    /// suffix: "accent1+tint40" → ("accent1", 0.40), "dk2+tint-25" →
+    /// ("dk2", -0.25). Values without a recognised `+tint…` suffix come back
+    /// unchanged with a null tint, so hex colors and plain names pass through.
+    ///
+    /// CONSISTENCY(scheme-color): the `name+transform` shape mirrors the pptx
+    /// color-transform suffix (`accent1+lumMod75`, see DrawingColorBuilder).
+    /// The value range differs on purpose — SpreadsheetML ST_Tint is SIGNED
+    /// (-1..1, negative darkens) whereas DrawingML a:tint is 0..100% only, so
+    /// this parser accepts -100..100 percent rather than reusing that parser.
+    /// </summary>
+    public static (string BaseName, double? Tint) SplitExcelColorTint(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return (value ?? "", null);
+        var plus = value.LastIndexOf('+');
+        if (plus <= 0) return (value, null);
+        var suffix = value[(plus + 1)..];
+        if (!suffix.StartsWith("tint", StringComparison.OrdinalIgnoreCase))
+            return (value, null);
+        var numText = suffix[4..].TrimStart('=');
+        if (!double.TryParse(numText, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var pct))
+            throw new ArgumentException(
+                $"Invalid tint '{suffix}': expected a percentage, e.g. 'accent1+tint40' or 'dk2+tint-25'.");
+        if (double.IsNaN(pct) || pct < -100 || pct > 100)
+            throw new ArgumentException(
+                $"Invalid tint '{suffix}': percentage must be between -100 and 100 (negative darkens, positive lightens).");
+        return (value[..plus], pct / 100.0);
+    }
+
+    /// <summary>
+    /// Inverse of <see cref="SplitExcelColorTint"/>: render a theme index plus
+    /// its stored tint as the canonical round-trip string. A zero/absent tint
+    /// emits the bare scheme name so existing output is unchanged.
+    /// </summary>
+    public static string? ExcelThemeNameWithTint(uint themeIndex, double? tint)
+    {
+        var name = ExcelThemeIndexToName(themeIndex);
+        if (name == null) return null;
+        if (tint is not { } t || Math.Abs(t) < ExcelTintEpsilon) return name;
+        var pct = Math.Round(t * 100.0, 2);
+        return name + "+tint" + pct.ToString(System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    /// <summary>Two SpreadsheetML @tint values are the same fill/font when they
+    /// agree within <see cref="ExcelTintEpsilon"/>; absent counts as zero.</summary>
+    public static bool ExcelTintMatches(double? a, double? b)
+        => Math.Abs((a ?? 0.0) - (b ?? 0.0)) < ExcelTintEpsilon;
+
+    /// <summary>
     /// Returns true if the value is a recognized boolean string and is truthy.
     /// Returns false for null, empty, or recognized falsy values ("false", "0", "no", "off").
     /// Throws <see cref="ArgumentException"/> for non-null values that are not recognized boolean strings.
@@ -541,6 +600,18 @@ internal static class ParseHelpers
         if (!byte.TryParse(value, CultureInfo.InvariantCulture, out var result))
             throw new ArgumentException($"Invalid '{propertyName}' value '{value}'. Expected an integer (0-255).");
         return result;
+    }
+
+    /// <summary>
+    /// Chart marker size: ST_MarkerSize is 2..72. A value outside the range is
+    /// rejected up front — written as-is it passes save but PowerPoint refuses
+    /// to open the file (and cannot repair it).
+    /// </summary>
+    public static byte ParseMarkerSize(string value, string propertyName)
+    {
+        if (!int.TryParse(value?.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) || n < 2 || n > 72)
+            throw new ArgumentException($"Invalid '{propertyName}' value '{value}'. Expected an integer 2-72 (ST_MarkerSize); use marker=none to hide markers.");
+        return (byte)n;
     }
 
     /// <summary>

@@ -25,6 +25,10 @@ public static class PluginRegistry
     private static readonly Dictionary<(PluginKind kind, string ext), ResolvedPlugin?> _cache
         = new();
     private static readonly object _cacheLock = new();
+    // Candidates that answered --info but declared another protocol major.
+    // Kept apart from "nothing found" so the caller can report the rejection
+    // as protocol_mismatch instead of the generic unsupported-type error.
+    private static readonly Dictionary<(PluginKind kind, string ext), (string path, int declared)> _protocolRejections = new();
 
     /// <summary>
     /// Resolve a plugin for the given kind + file extension. Returns null if no
@@ -56,7 +60,7 @@ public static class PluginRegistry
     /// </summary>
     public static void InvalidateCache()
     {
-        lock (_cacheLock) _cache.Clear();
+        lock (_cacheLock) { _cache.Clear(); _protocolRejections.Clear(); }
     }
 
     /// <summary>
@@ -89,11 +93,35 @@ public static class PluginRegistry
         foreach (var candidate in CandidatePaths(kind, ext))
         {
             if (!File.Exists(candidate)) continue;
-            if (!TryReadManifest(candidate, out var m)) continue;
+            if (!TryReadManifest(candidate, out var m, out var declaredProtocol))
+            {
+                if (declaredProtocol is int rejected)
+                    lock (_cacheLock) _protocolRejections[(kind, ext)] = (candidate, rejected);
+                continue;
+            }
             if (!ManifestMatches(m, kind, ext)) continue;
             return new ResolvedPlugin(candidate, m);
         }
         return null;
+    }
+
+    /// <summary>
+    /// After a <see cref="FindFor"/> that returned null: the candidate (if any)
+    /// that was refused because its manifest declares a protocol major other
+    /// than <see cref="SupportedProtocolVersion"/>.
+    /// </summary>
+    public static bool TryGetProtocolRejection(PluginKind kind, string ext, out string path, out int declared)
+    {
+        lock (_cacheLock)
+        {
+            if (_protocolRejections.TryGetValue((kind, NormalizeExt(ext)), out var r))
+            {
+                (path, declared) = r;
+                return true;
+            }
+        }
+        path = ""; declared = 0;
+        return false;
     }
 
     /// <summary>
@@ -251,8 +279,17 @@ public static class PluginRegistry
     /// Callers should treat false the same way they treat "plugin not found".
     /// </summary>
     public static bool TryReadManifest(string executablePath, out PluginManifest manifest)
+        => TryReadManifest(executablePath, out manifest, out _);
+
+    /// <summary>
+    /// As <see cref="TryReadManifest(string, out PluginManifest)"/>, additionally
+    /// reporting the protocol a well-formed manifest declared when that is the
+    /// reason it was refused (null for every other failure).
+    /// </summary>
+    public static bool TryReadManifest(string executablePath, out PluginManifest manifest, out int? rejectedProtocol)
     {
         manifest = new PluginManifest();
+        rejectedProtocol = null;
         try
         {
             using var p = new Process
@@ -303,6 +340,7 @@ public static class PluginRegistry
                 Console.Error.WriteLine(
                     $"[warning] plugin at {executablePath} declares protocol={parsed.Protocol} " +
                     $"but main supports protocol={SupportedProtocolVersion}; plugin will not load.");
+                rejectedProtocol = parsed.Protocol;
                 return false;
             }
 

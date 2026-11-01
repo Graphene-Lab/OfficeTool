@@ -153,16 +153,7 @@ public partial class PowerPointHandler
                 // UNSUPPORTED while Set succeeded.
                 if (properties.TryGetValue("lang", out var notesLang))
                 {
-                    Shape? notesBody = null;
-                    var notesShapeTree = notesSlidePart.NotesSlide?.CommonSlideData?.ShapeTree;
-                    if (notesShapeTree != null)
-                    {
-                        foreach (var sh in notesShapeTree.Elements<Shape>())
-                        {
-                            var ph = sh.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties?.GetFirstChild<PlaceholderShape>();
-                            if (ph?.Index?.Value == 1) { notesBody = sh; break; }
-                        }
-                    }
+                    var notesBody = FindNotesBodyShape(notesSlidePart.NotesSlide?.CommonSlideData?.ShapeTree);
                     if (notesBody != null)
                     {
                         var notesRuns = notesBody.Descendants<Drawing.Run>().ToList();

@@ -24,6 +24,21 @@ public static class IssueSubtypes
     public const string DefinedNameBroken = "definedname_broken";
     public const string DefinedNameTargetMissing = "definedname_target_missing";
     public const string BrokenPartRef = "broken_part_ref";
+    /// <summary>xlsx-only: a visible numeric/date cell with an explicit,
+    /// width-stable number format cannot fit its formatted value in the visible
+    /// column budget. General and unresolved formats are intentionally skipped
+    /// because Excel can adapt their display to the available width. Format
+    /// bucket, Warning.</summary>
+    public const string NumericOverflow = "numeric_overflow";
+    /// <summary>xlsx-only: a visible General-formatted numeric cell whose value
+    /// needs more than 11 significant digits. Excel's General display caps
+    /// there and switches to scientific notation REGARDLESS of column width,
+    /// so the delivered document shows a rounded number with no visual cue and
+    /// widening the column does not fix it — the remedy is an explicit number
+    /// format. Disjoint from <see cref="NumericOverflow"/>, which covers the
+    /// opposite case (an explicit format that cannot fit the column).
+    /// Format bucket, Warning.</summary>
+    public const string GeneralPrecisionLoss = "general_precision_loss";
     /// <summary>pptx-only: notesSlide raw-set passthrough references an
     /// rId (<c>r:embed</c> / <c>r:link</c>) the dump pass cannot reproduce
     /// on the replay target (e.g. a non-image rel attached to a NotesSlidePart
@@ -40,6 +55,17 @@ public static class IssueSubtypes
     /// translucent runs, and colors carrying lumMod/shade transforms are
     /// skipped to keep false positives near zero. Format bucket, Warning.</summary>
     public const string LowContrast = "low_contrast";
+
+    /// <summary>pptx-only: a picture whose box aspect ratio differs from its
+    /// source pixels' (crop and stretch inset folded in) by more than 5% —
+    /// the image is being stretched. Pictures covering the whole slide are
+    /// skipped (a texture pulled over a background is intentional).</summary>
+    public const string PictureAspectDistorted = "picture_aspect_distorted";
+
+    /// <summary>docx: an inline picture sits in a paragraph whose effective
+    /// line spacing is <c>lineRule="exact"</c> and shorter than the picture.
+    /// Word clips the picture to the line height, so only a strip renders.</summary>
+    public const string PictureClippedByLineSpacing = "picture_clipped_by_line_spacing";
 
     /// <summary>Broad IssueType bucket names — the canonical surface shown
     /// in error messages and help. Single-letter aliases (<see cref="BucketAliases"/>)
@@ -62,16 +88,15 @@ public static class IssueSubtypes
     public static readonly string[] ValidSubtypes = new[]
     {
         FormulaNotEvaluated, FormulaCacheStale, FormulaRefMissingSheet, FormulaEvalError,
-        FieldNotEvaluated, FieldCacheStale,
-        SlideFieldNotEvaluated, NotesUnresolvedRid, LowContrast,
+        FieldNotEvaluated, FieldCacheStale, PictureClippedByLineSpacing,
+        SlideFieldNotEvaluated, NotesUnresolvedRid, LowContrast, PictureAspectDistorted,
         ChartSeriesRefMissingSheet, ChartCacheStale,
         DefinedNameBroken, DefinedNameTargetMissing,
-        BrokenPartRef,
+        BrokenPartRef, NumericOverflow, GeneralPrecisionLoss,
     };
 
-    /// <summary>Subtypes that are scanned by default and surface under
-    /// <c>--type content</c>. Opt-in subtypes (currently only
-    /// <see cref="ChartCacheStale"/>) require an exact-name request.</summary>
+    /// <summary>Subtypes that require an exact-name request rather than being
+    /// scanned by default or via their broad issue bucket.</summary>
     public static readonly string[] OptInSubtypes = new[] { ChartCacheStale };
 
     /// <summary>One-line summary suitable for the CLI <c>--type</c> help
@@ -83,12 +108,12 @@ public static class IssueSubtypes
         return "Issue type filter. Broad buckets: "
             + string.Join(", ", BucketNames)
             + " (alias " + string.Join(", ", BucketAliases) + "). "
-            + "Subtypes (Content bucket, returned by default and via --type content): "
+            + "Subtypes (returned by default and via their matching broad bucket): "
             + string.Join(", ", defaults) + ". "
             + "Opt-in only (request by exact name; not included in --type content): "
             + string.Join(", ", OptInSubtypes) + ". "
-            + "Subtypes are format-specific — formula_* / chart_* / definedname_* apply to xlsx, "
-            + "field_* to docx, slide_field_* / notes_unresolved_rid / broken_part_ref / low_contrast to pptx; requesting a subtype that does not apply to "
+            + "Subtypes are format-specific — formula_* / chart_* / definedname_* / numeric_overflow apply to xlsx, "
+            + "field_* / picture_clipped_by_line_spacing to docx, slide_field_* / notes_unresolved_rid / broken_part_ref / low_contrast / picture_aspect_distorted to pptx; requesting a subtype that does not apply to "
             + "the queried file returns count=0 (not an error). "
             + "All values are case-insensitive and surrounding whitespace is trimmed.";
     }

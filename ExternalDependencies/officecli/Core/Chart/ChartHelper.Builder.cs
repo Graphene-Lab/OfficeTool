@@ -433,6 +433,7 @@ internal static partial class ChartHelper
         }
 
         // Apply cell references for dotted syntax (series1.values=Sheet1!B2:B13)
+        ApplySeriesLiteralXValues(plotArea, properties);
         ApplySeriesReferences(plotArea, properties);
 
         // Restore source c:idx / c:order (series{N}.seriesIdx / .seriesOrder).
@@ -472,6 +473,46 @@ internal static partial class ChartHelper
     /// Replace literal Values/CategoryAxisData with NumberReference/StringReference
     /// when dotted syntax cell references are used.
     /// </summary>
+    /// <summary>
+    /// Scatter / bubble: a series' own literal <c>series{N}.categories=2.7,5.9</c>
+    /// becomes that series' X values (<c>c:xVal</c>). It used to be read and
+    /// dropped (only the cell-range form was honoured), so every series took the
+    /// chart-level categories — or 1, 2, … — as X and a scatter with one series
+    /// per group of points could not be built through props (#501). The range
+    /// form is still handled by <see cref="ApplySeriesReferences"/>.
+    /// </summary>
+    private static void ApplySeriesLiteralXValues(C.PlotArea plotArea, Dictionary<string, string> properties)
+    {
+        var allSer = plotArea.Descendants<OpenXmlCompositeElement>()
+            .Where(e => e.LocalName == "ser").ToList();
+        for (int i = 1; i <= allSer.Count; i++)
+        {
+            if (!properties.TryGetValue($"series{i}.categories", out var cats)
+                || string.IsNullOrWhiteSpace(cats) || IsRangeReference(cats)) continue;
+            if (allSer[i - 1] is not (C.ScatterChartSeries or C.BubbleChartSeries)) continue;
+            var xs = ParseSeriesValues(cats, $"series{i}.categories");
+            var lit = new C.NumberLiteral(new C.FormatCode("General"),
+                new C.PointCount { Val = (uint)xs.Length });
+            for (int k = 0; k < xs.Length; k++)
+                lit.AppendChild(new C.NumericPoint(new C.NumericValue(
+                    xs[k].ToString("R", System.Globalization.CultureInfo.InvariantCulture))) { Index = (uint)k });
+            var xVal = allSer[i - 1].GetFirstChild<C.XValues>();
+            if (xVal != null)
+            {
+                xVal.RemoveAllChildren();
+                xVal.AppendChild(lit);
+            }
+            else
+            {
+                // CT_ScatterSer / CT_BubbleSer: xVal precedes yVal.
+                var yVal = allSer[i - 1].GetFirstChild<C.YValues>();
+                var newX = new C.XValues(lit);
+                if (yVal != null) yVal.InsertBeforeSelf(newX);
+                else allSer[i - 1].AppendChild(newX);
+            }
+        }
+    }
+
     private static void ApplySeriesReferences(C.PlotArea plotArea, Dictionary<string, string> properties)
     {
         var extSeries = ParseSeriesDataExtended(properties);
@@ -1466,8 +1507,23 @@ internal static partial class ChartHelper
 
     internal static void ApplySeriesColor(OpenXmlCompositeElement series, string color)
     {
+        // #500: a markers-only scatter series (its line seeded as noFill by
+        // BuildScatterChart, or the group's scatterStyle=marker) must stay
+        // line-less. Writing the colour as a 2pt line stroke here made
+        // PowerPoint and other renderers — which draw by the series line and
+        // ignore scatterStyle — connect the points. Colour the markers instead.
+        bool markerOnly = IsMarkerOnlyScatterSeries(series);
         series.RemoveAllChildren<C.ChartShapeProperties>();
         var spPr = new C.ChartShapeProperties();
+        if (markerOnly && !color.Equals("none", StringComparison.OrdinalIgnoreCase))
+        {
+            spPr.AppendChild(new Drawing.Outline(new Drawing.NoFill()));
+            var serTextM = series.GetFirstChild<C.SeriesText>();
+            if (serTextM != null) serTextM.InsertAfterSelf(spPr);
+            else series.PrependChild(spPr);
+            ColorScatterMarker(series, color);
+            return;
+        }
         if (color.Equals("none", StringComparison.OrdinalIgnoreCase))
         {
             spPr.AppendChild(new Drawing.NoFill());
@@ -1508,6 +1564,41 @@ internal static partial class ChartHelper
             serText.InsertAfterSelf(spPr);
         else
             series.PrependChild(spPr);
+    }
+
+    /// <summary>
+    /// A scatter series that draws markers only: its line is explicitly noFill,
+    /// or its scatterChart's scatterStyle is marker.
+    /// </summary>
+    internal static bool IsMarkerOnlyScatterSeries(OpenXmlCompositeElement series)
+    {
+        bool isScatter = series is C.ScatterChartSeries || series.Parent?.LocalName == "scatterChart";
+        if (!isScatter) return false;
+        var ln = series.GetFirstChild<C.ChartShapeProperties>()?.GetFirstChild<Drawing.Outline>();
+        if (ln?.GetFirstChild<Drawing.NoFill>() != null) return true;
+        var style = (series.Parent as C.ScatterChart)?.GetFirstChild<C.ScatterStyle>()?.Val;
+        return style?.HasValue == true && style.Value == C.ScatterStyleValues.Marker;
+    }
+
+    /// <summary>
+    /// Put <paramref name="color"/> on a scatter series' markers — fill AND
+    /// outline (an outline left unset falls back to the theme accent in
+    /// PowerPoint, tinting a blue marker purple). Keeps the marker's symbol and
+    /// size; a series without a marker gets a circle.
+    /// </summary>
+    internal static void ColorScatterMarker(OpenXmlCompositeElement series, string color)
+    {
+        var marker = series.GetFirstChild<C.Marker>();
+        if (marker == null)
+        {
+            marker = new C.Marker(new C.Symbol { Val = C.MarkerStyleValues.Circle });
+            InsertSeriesChildInOrder(series, marker);
+        }
+        marker.RemoveAllChildren<C.ChartShapeProperties>();
+        var fill = new Drawing.SolidFill(); fill.AppendChild(BuildChartColorElement(color));
+        var lnFill = new Drawing.SolidFill(); lnFill.AppendChild(BuildChartColorElement(color));
+        // CT_Marker: symbol?, size?, spPr? — spPr is last.
+        marker.AppendChild(new C.ChartShapeProperties(fill, new Drawing.Outline(lnFill)));
     }
 
     /// <summary>

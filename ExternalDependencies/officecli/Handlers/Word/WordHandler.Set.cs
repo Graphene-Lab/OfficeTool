@@ -69,7 +69,17 @@ public partial class WordHandler
 
     public List<string> Set(string path, Dictionary<string, string> properties)
     {
-        Modified = true;
+        // A set that applied nothing (every prop unsupported) is a no-op and
+        // must not mark the document modified — it used to rewrite the file.
+        LastSelectorSetCount = 0;
+        var wasModified = Modified;
+        var unsupported = MarkModified(() => SetCore(path, properties));
+        if (properties.Count > 0 && unsupported.Count >= properties.Count) Modified = wasModified;
+        return unsupported;
+    }
+
+    private List<string> SetCore(string path, Dictionary<string, string> properties)
+    {
         LastSetWarnings = new List<string>();
         LastUnrecognizedLatex = new List<string>();
         LastSetNewPath = null;
@@ -140,13 +150,13 @@ public partial class WordHandler
                 path, Query, keyResolver: null, applyAll: false);
             if (targets.Count == 0)
                 throw new ArgumentException($"No elements matched selector: {path}");
-            LastSelectorSetCount = targets.Count;
             foreach (var target in targets)
             {
                 var targetUnsupported = Set(target.Path, properties);
                 foreach (var u in targetUnsupported)
                     if (!unsupported.Contains(u)) unsupported.Add(u);
             }
+            LastSelectorSetCount = targets.Count; // after the per-target calls, which reset it
             return unsupported;
         }
 
@@ -585,8 +595,11 @@ public partial class WordHandler
         }
         catch
         {
-            // Rollback: restore element to pre-modification state
-            element.Parent?.ReplaceChild(elementBackup, element);
+            // Rollback: restore element to pre-modification state, in place so
+            // the nav caches and later commands keep addressing the live element
+            // (issue #424). Descendants are fresh clones — drop the child caches.
+            OfficeCli.Core.ElementRollback.RestoreInPlace(element, elementBackup);
+            ClearNavChildCaches();
             throw;
         }
     }
@@ -831,9 +844,37 @@ public partial class WordHandler
         if (rPr != null)
             style.InsertBefore(pPr, rPr);
         else
+        {
+            // Nothing to insert before — but a table style can still own
+            // tblPr / trPr / tcPr / tblStylePr, and CT_Style places all of
+            // those after pPr, so let the schema authority slot it instead of
+            // tail-appending past them (issue #434).
             style.AppendChild(pPr);
+            Core.SchemaOrder.Place(style, pPr);
+        }
         return pPr;
     }
+
+    /// <summary>Attach a direct CT_Style child at its schema slot. A bare
+    /// AppendChild puts it after whatever the style already owns, and most of
+    /// these children (name / aliases / basedOn / next / link) precede pPr and
+    /// rPr in CT_Style — so on a style that already has pPr/rPr the append
+    /// landed them last and the SDK validator reported "unexpected child
+    /// element" (issue #434: `set /styles/Normal --prop basedOn=Title` wrote
+    /// basedOn after pPr). The Style particle declares all of them, so
+    /// SchemaOrder.Place knows the slot.</summary>
+    private static T InsertStyleChild<T>(Style style, T child) where T : OpenXmlElement
+    {
+        style.AppendChild(child);
+        Core.SchemaOrder.Place(style, child);
+        return child;
+    }
+
+    /// <summary>The style's rPr, created at its CT_Style slot when absent. A bare
+    /// AppendChild tail-appends it — after tblPr / trPr / tcPr on a table style,
+    /// where CT_Style places rPr before them (issue #434).</summary>
+    private static StyleRunProperties EnsureStyleRunProperties(Style style)
+        => style.StyleRunProperties ?? InsertStyleChild(style, new StyleRunProperties());
 
     private static BorderValues ParseBorderStyle(string style) => style.ToLowerInvariant() switch
     {
@@ -1134,8 +1175,12 @@ public partial class WordHandler
                 // R7 deferred BT-4: warn (advisory, non-fatal) when the
                 // style id does not exist in the styles part — opening
                 // such a doc in Word shows a "style not found" badge.
-                if (warnings != null && !StyleIdExists(value))
-                    warnings.Add($"style '{value}' not found in styles part — will be referenced as-is");
+                // Built-in ids are materialized rather than left dangling
+                // (issue #407) — see Add's `style` handling.
+                if (TryMaterializeBuiltInStyle(value))
+                    warnings?.Add($"style '{value}' was not defined in the styles part; added Word's built-in definition ('{BuiltInStyleName(value)}')");
+                else if (warnings != null && !StyleIdExists(value))
+                    warnings.Add(StyleNotFoundWarning(value));
                 pProps.ParagraphStyleId = new ParagraphStyleId { Val = value };
                 return true;
             case "stylename":
@@ -1163,11 +1208,22 @@ public partial class WordHandler
                 // CONSISTENCY(lenient-spacing): mirror Add — accept cm/in/pt/twips via SpacingConverter.
                 // BUG-DUMP-NEGIND: signed.
                 indentL.Left = SpacingConverter.ParseWordSpacingSigned(value).ToString();
+                // BUG-IND-ALIAS (#367): w:start is the ISO/strict spelling of
+                // w:left. A source that uses it (Google Docs / Word-for-Mac
+                // exports) kept the OLD w:start alongside our new w:left, so the
+                // element carried two conflicting indents; whichever one a later
+                // normalizing save collapses decides the result, which looked
+                // like the indent randomly disappearing. Fold the aliases on
+                // BOTH sides so the element never mixes spellings (a lone
+                // w:end="0" left behind is not a conflict, but the next tool to
+                // touch it may make it one).
+                WordIndentAliases.Normalize(indentL);
                 return true;
             case "rightindent" or "indentright":
                 var indentR = pProps.Indentation ?? (pProps.Indentation = new Indentation());
                 // BUG-DUMP-NEGIND: signed.
                 indentR.Right = SpacingConverter.ParseWordSpacingSigned(value).ToString();
+                WordIndentAliases.Normalize(indentR); // BUG-IND-ALIAS (#367)
                 return true;
             case "hangingindent" or "hanging":
                 var indentH = pProps.Indentation ?? (pProps.Indentation = new Indentation());

@@ -10,8 +10,8 @@ is licensed under the **GNU Affero General Public License v3.0** — see
 
 This package contains a vendored copy of the **OfficeCLI** engine
 (https://github.com/iOfficeAI/OfficeCLI), Copyright © 2026 OfficeCLI
-(https://OfficeCLI.AI), version **v1.0.144** (commit
-`1ced45e900782c5083ed550ddf328ee974e425e7`), licensed under the
+(https://OfficeCLI.AI), version **v1.0.160** (commit
+`c56512c8c7b76fe284f09940e4cd492470099d3e`), licensed under the
 **Apache License, Version 2.0**.
 
 The vendored source is kept byte-identical to upstream (only the CLI entry point

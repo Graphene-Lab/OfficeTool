@@ -158,7 +158,7 @@ internal partial class FormulaEvaluator
     private static double CoerceToNumber(FormulaResult? r)
     {
         if (r == null) return 0;
-        if (r.IsString && double.TryParse(r.StringValue, NumberStyles.Any, CultureInfo.InvariantCulture, out var v))
+        if (r.IsString && NumericText.TryParse(r.StringValue, out var v))
             return v;
         return r.AsNumber();
     }

@@ -399,7 +399,12 @@ public partial class WordHandler
                     // injecting text would corrupt the OOXML structure
                     // (e.g. <w:t> next to <w:instrText> breaks PAGE field
                     // rendering). Reject so the caller sees `unsupported`.
-                    if (isSpecialRun)
+                    //
+                    // BUG #335: a run holding a drawing / VML picture / embedded
+                    // object also has no <w:t>; without this guard the update
+                    // below (which only writes when a <w:t> already exists)
+                    // reported success while writing nothing. Reject instead.
+                    if (isSpecialRun || RunCarriesNonText(run))
                     {
                         unsupported.Add(key);
                         break;
@@ -1251,6 +1256,28 @@ public partial class WordHandler
         return consumed;
     }
 
+    /// <summary>
+    /// Run-level keys that a paragraph (and a table cell) Set fans out to the
+    /// runs it contains, falling back to the paragraph mark when there are no
+    /// runs. Single source for both containers: the cell branch used to carry
+    /// its own shorter list (font/size/bold/…) and refused font.ea / font.cs /
+    /// size.cs that the paragraph and run accept, so a CJK table header could
+    /// not be styled at cell level (issue #427). CONSISTENCY(set-para-run-keys).
+    /// </summary>
+    private static readonly HashSet<string> ContainerRunFanoutKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "size", "fontsize", "font", "bold", "italic", "color",
+        "highlight", "underline", "strike", "underline.color", "underlinecolor", "font.underline.color",
+        "font.latin", "font.ascii", "font.hansi", "font.ea", "font.eastasia", "font.eastasian",
+        "font.cs", "font.complexscript", "font.complex", "bold.cs", "italic.cs", "size.cs",
+        "font.bold.cs", "font.italic.cs", "font.size.cs", "font.asciitheme", "font.hansitheme", "font.eatheme",
+        "font.eastasiatheme", "font.cstheme", "kern", "bdr", "lang", "lang.latin",
+        "lang.val", "lang.ea", "lang.eastasia", "lang.cs", "lang.bidi", "font.hint",
+        "charspacing", "charscale", "w", "caps", "smallcaps", "vanish",
+        "dstrike", "outline", "shadow", "emboss", "imprint", "noproof",
+        "superscript", "subscript",
+    };
+
     private List<string> SetElementParagraph(Paragraph para, Dictionary<string, string> properties)
     {
         var unsupported = new List<string>();
@@ -1433,40 +1460,25 @@ public partial class WordHandler
                     }
                     break;
                 }
-                case "size" or "fontsize" or "font" or "bold" or "italic" or "color" or "highlight" or "underline" or "strike"
-                  or "underline.color" or "underlinecolor" or "underlineColor" or "font.underline.color"
-                  or "font.latin" or "font.ascii" or "font.hansi" or "font.hAnsi"
-                  or "font.ea" or "font.eastasia" or "font.eastasian"
-                  or "font.cs" or "font.complexscript" or "font.complex"
-                  or "bold.cs" or "italic.cs" or "size.cs"
-                  or "font.bold.cs" or "font.italic.cs" or "font.size.cs"
-                  or "font.asciitheme" or "font.asciiTheme"
-                  or "font.hansitheme" or "font.hAnsiTheme"
-                  or "font.eatheme" or "font.eaTheme" or "font.eastasiatheme"
-                  or "font.cstheme" or "font.csTheme"
-                  // CONSISTENCY(set-para-run-keys): rPr-bound keys that also
-                  // belong on the paragraph mark when no runs exist yet.
-                  // ApplyRunFormatting handles each individually.
-                  or "kern" or "bdr" or "lang" or "lang.latin" or "lang.val"
-                  or "lang.ea" or "lang.eastasia" or "lang.cs" or "lang.bidi"
-                  // <w:rFonts w:hint> is run-bound: falling through to the
-                  // dotted pPr fallback wrote it on the paragraph MARK only,
-                  // so a CJK run lost its eastAsia hint (different font
-                  // metrics, re-wrapped table rows) while the mark gained a
-                  // phantom one. charspacing/charscale are rPr-bound too.
-                  or "font.hint" or "charspacing" or "charscale" or "w"
-                  // BUG-DUMP-R46-SCAPS: run on/off typography toggles. The
-                  // single-run-collapse dump folds these into `set <paragraph>`,
-                  // but they were absent from this run-key case and fell through
-                  // to the dotted-pPr fallback (applied to the ¶ mark only, never
-                  // the visible runs) — so a small-caps / caps / vanish table
-                  // header lost its effect on round-trip. ApplyRunFormatting
-                  // handles each; route them to the runs like bold/italic. (rtl /
-                  // shading omitted — those carry paragraph-level meaning and are
-                  // handled by ApplyParagraphLevelProperty / the direction cascade.)
-                  or "caps" or "smallcaps" or "vanish" or "dstrike"
-                  or "outline" or "shadow" or "emboss" or "imprint"
-                  or "noproof" or "superscript" or "subscript":
+                // Key list: ContainerRunFanoutKeys (shared with the table-cell branch).
+                // CONSISTENCY(set-para-run-keys): rPr-bound keys that also
+                // belong on the paragraph mark when no runs exist yet.
+                // ApplyRunFormatting handles each individually.
+                // <w:rFonts w:hint> is run-bound: falling through to the
+                // dotted pPr fallback wrote it on the paragraph MARK only,
+                // so a CJK run lost its eastAsia hint (different font
+                // metrics, re-wrapped table rows) while the mark gained a
+                // phantom one. charspacing/charscale are rPr-bound too.
+                // BUG-DUMP-R46-SCAPS: run on/off typography toggles. The
+                // single-run-collapse dump folds these into `set <paragraph>`,
+                // but they were absent from this run-key case and fell through
+                // to the dotted-pPr fallback (applied to the ¶ mark only, never
+                // the visible runs) — so a small-caps / caps / vanish table
+                // header lost its effect on round-trip. ApplyRunFormatting
+                // handles each; route them to the runs like bold/italic. (rtl /
+                // shading omitted — those carry paragraph-level meaning and are
+                // handled by ApplyParagraphLevelProperty / the direction cascade.)
+                case var _ when ContainerRunFanoutKeys.Contains(k):
                     // Apply run-level formatting to all runs in the paragraph.
                     var allParaRuns = para.Descendants<Run>().ToList();
                     // Paragraph-mark run properties (<w:rPr> inside <w:pPr>)
@@ -1526,20 +1538,31 @@ public partial class WordHandler
                     }
                     break;
                 case "text":
-                    // Set text on paragraph: update first run or create one.
+                    // Set text on paragraph: update first TEXT run or create one.
                     // CONSISTENCY(text-breaks): route through AppendTextWithBreaks
                     // so \n/\t in value become <w:br/>/<w:tab/>, matching Add behavior.
-                    var existingRuns = para.Elements<Run>().ToList();
-                    if (existingRuns.Count > 0)
+                    //
+                    // BUG #334: only text-bearing runs are replaced. A run that
+                    // carries a drawing / VML picture / mc:AlternateContent shape /
+                    // embedded object / field is preserved verbatim — wiping or
+                    // removing it silently destroyed every graphic anchored in the
+                    // paragraph (floating textboxes, floating + inline pictures).
+                    // Text-only paragraphs behave exactly as before (all runs are
+                    // text runs). Run-level `set /body/p[N]/r[M] --prop text=` was
+                    // already non-destructive and is unchanged.
+                    var runsForTextSet = para.Elements<Run>().ToList();
+                    var textRuns = runsForTextSet.Where(r => !RunCarriesNonText(r)).ToList();
+                    if (textRuns.Count > 0)
                     {
-                        // Preserve RunProperties from first run, drop all prior text/break/tab children.
-                        var keepRun = existingRuns[0];
+                        // Preserve RunProperties from the first text run, drop its
+                        // prior text/break/tab children, keep every non-text run.
+                        var keepRun = textRuns[0];
                         var keepRProps = keepRun.RunProperties;
                         keepRun.RemoveAllChildren();
                         if (keepRProps != null)
                             keepRun.AppendChild(keepRProps);
                         AppendTextWithBreaks(keepRun, value);
-                        for (int i = 1; i < existingRuns.Count; i++) existingRuns[i].Remove();
+                        for (int i = 1; i < textRuns.Count; i++) textRuns[i].Remove();
                     }
                     else
                     {
@@ -1940,18 +1963,7 @@ public partial class WordHandler
                     OfficeCli.Core.ParseHelpers.ValidateXmlText(value, "text");
                     deferredText = value;
                     break;
-                case "font":
-                case "size":
-                case "fontsize":
-                case "bold":
-                case "italic":
-                case "color":
-                case "highlight":
-                case "underline":
-                case "underline.color":
-                case "underlinecolor":
-                case "underlineColor":
-                case "strike":
+                case var cellRunKey when ContainerRunFanoutKeys.Contains(cellRunKey):
                     // Apply to all runs in all paragraphs in the cell
                     // CONSISTENCY(run-prop-helper): per-prop OOXML write
                     // logic lives in ApplyRunFormatting; this branch
@@ -2467,7 +2479,7 @@ public partial class WordHandler
                         break;
                     if (!GenericXmlQuery.TryCreateTypedChild(tcPr, key, value))
                         unsupported.Add(unsupported.Count == 0
-                            ? $"{key} (valid cell props: text, font, size, bold, italic, color, alignment, valign, width, shd, border, colspan, fitText, textDirection, nowrap, padding)"
+                            ? $"{key} (valid cell props: text, font, font.ea, font.cs, size, size.cs, bold, italic, color, alignment, valign, width, shd, border, colspan, fitText, textDirection, nowrap, padding)"
                             : key);
                     break;
             }
@@ -3255,6 +3267,32 @@ public partial class WordHandler
                                 var rcTcPr = rc.TableCellProperties ?? rc.PrependChild(new TableCellProperties());
                                 var gw = gridColsAfter[gIdx].Width?.Value ?? "0";
                                 rcTcPr.TableCellWidth = new TableCellWidth { Width = gw, Type = TableWidthUnitValues.Dxa };
+                            }
+                            gIdx += rcSpan;
+                        }
+                    }
+                    // A merged (gridSpan > 1) cell's tcW must equal the sum of
+                    // the grid columns it spans. The loops above deliberately
+                    // skip multi-span cells, which left their OLD tcW in place:
+                    // tblGrid said 4000+1000 while the merged cell still claimed
+                    // 5536, a silent grid/cell disagreement that Word resolves by
+                    // re-flowing the column widths. Re-stamp every merged cell
+                    // whose span touches an updated column from the final grid.
+                    foreach (var tblRow in tbl.Elements<TableRow>())
+                    {
+                        int gIdx = 0;
+                        foreach (var rc in tblRow.Elements<TableCell>())
+                        {
+                            var rcSpan = rc.TableCellProperties?.GridSpan?.Val?.Value ?? 1;
+                            if (rcSpan > 1
+                                && gIdx < parts.Length
+                                && gIdx + rcSpan <= gridColsAfter.Count)
+                            {
+                                long sum = 0;
+                                for (int k = gIdx; k < gIdx + rcSpan; k++)
+                                    sum += long.TryParse(gridColsAfter[k].Width?.Value, out var w) ? w : 0;
+                                var rcTcPr = rc.TableCellProperties ?? rc.PrependChild(new TableCellProperties());
+                                rcTcPr.TableCellWidth = new TableCellWidth { Width = sum.ToString(), Type = TableWidthUnitValues.Dxa };
                             }
                             gIdx += rcSpan;
                         }

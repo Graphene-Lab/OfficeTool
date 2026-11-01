@@ -14,10 +14,12 @@ namespace OfficeCli.Handlers;
 public partial class PowerPointHandler
 {
     public string? Remove(string path, Dictionary<string, string>? properties = null)
+        => MarkModified(() => RemoveCore(path, properties));
+
+    private string? RemoveCore(string path, Dictionary<string, string>? properties)
     {
         // Phase 4: trackChange.* is Word-only. Silently ignored here for now;
         // PowerPoint has no revision-tracking schema equivalent.
-        Modified = true;
         // CONSISTENCY(null-path-guard): callers that pass null get an
         // ArgumentNullException instead of a confusing downstream NRE.
         // Mirrors the Word/Excel guards on the same surface.
@@ -712,6 +714,9 @@ public partial class PowerPointHandler
     }
 
     public string Move(string sourcePath, string? targetParentPath, InsertPosition? position, Dictionary<string, string>? properties = null)
+        => MarkModified(() => MoveCore(sourcePath, targetParentPath, position, properties));
+
+    private string MoveCore(string sourcePath, string? targetParentPath, InsertPosition? position, Dictionary<string, string>? properties)
     {
         // pptx has no track-change concept; `properties` is accepted for IDocumentHandler parity but ignored.
         var index = position?.Index;
@@ -977,6 +982,9 @@ public partial class PowerPointHandler
     }
 
     public (string NewPath1, string NewPath2) Swap(string path1, string path2)
+        => MarkModified(() => SwapCore(path1, path2));
+
+    private (string NewPath1, string NewPath2) SwapCore(string path1, string path2)
     {
         path1 = ResolveIdPath(path1);
         path2 = ResolveIdPath(path2);
@@ -1183,6 +1191,9 @@ public partial class PowerPointHandler
     }
 
     public string CopyFrom(string sourcePath, string targetParentPath, InsertPosition? position)
+        => MarkModified(() => CopyFromCore(sourcePath, targetParentPath, position));
+
+    private string CopyFromCore(string sourcePath, string targetParentPath, InsertPosition? position)
     {
         var index = position?.Index;
         sourcePath = ResolveIdPath(sourcePath);
@@ -1233,9 +1244,9 @@ public partial class PowerPointHandler
         var (srcSlidePart, srcElement) = ResolveSlideElement(sourcePath, slideParts);
         var clone = srcElement.CloneNode(true);
 
-        // Assign new unique cNvPr.Id to the clone to avoid duplicate IDs on the target slide
-        var cloneNvPr = clone.Descendants<NonVisualDrawingProperties>().FirstOrDefault();
-        if (cloneNvPr != null)
+        // Assign a new unique cNvPr.Id to the clone AND to every shape nested in
+        // it: a cloned group used to keep its children's ids, so each child id
+        // appeared twice on the slide.
         {
             var tgtSlideMatchPre = Regex.Match(targetParentPath, @"^/slide\[(\d+)\]$");
             if (tgtSlideMatchPre.Success)
@@ -1245,7 +1256,8 @@ public partial class PowerPointHandler
                 {
                     var tgtTree = GetSlide(slideParts[tgtIdx - 1]).CommonSlideData?.ShapeTree;
                     if (tgtTree != null)
-                        cloneNvPr.Id = GenerateUniqueShapeId(tgtTree);
+                        foreach (var nv in clone.Descendants<NonVisualDrawingProperties>().ToList())
+                            nv.Id = GenerateUniqueShapeId(tgtTree);
                 }
             }
         }
@@ -1261,9 +1273,12 @@ public partial class PowerPointHandler
         var tgtShapeTree = GetSlide(tgtSlidePart).CommonSlideData?.ShapeTree
             ?? throw new InvalidOperationException("Slide has no shape tree");
 
-        // Copy relationships if across slides
-        if (srcSlidePart != tgtSlidePart)
-            CopyRelationships(clone, srcSlidePart, tgtSlidePart);
+        // Copy relationships on every clone, same slide included: a part the
+        // clone must own (chart, embedded workbook, diagram) is deep-copied
+        // there, while shareable parts (images, media) keep their rId. Skipping
+        // this for a same-slide clone left two chart frames pointing at one
+        // chart part, which PowerPoint refuses to open.
+        CopyRelationships(clone, srcSlidePart, tgtSlidePart);
 
         InsertAtPosition(tgtShapeTree, clone, index);
         GetSlide(tgtSlidePart).Save();
@@ -1702,6 +1717,27 @@ public partial class PowerPointHandler
                     && shapeIdRemap.TryGetValue(endCxn.Id.Value, out var mappedEnd))
                     endCxn.Id = mappedEnd;
             }
+
+            // Animations name their shapes by id too: p:spTgt/@spid inside
+            // the timing tree and p:bldP / p:bldOleChart / p:bldDgm /
+            // p:bldGraphic @spid in p:bldLst. Left untouched, the clone's
+            // timing still pointed at the source slide's shape ids, which do
+            // not exist on the copy; real PowerPoint refuses to open such a
+            // deck. Every spid attribute under p:timing is remapped.
+            var timing = newSlidePart.Slide.Timing;
+            if (timing != null && shapeIdRemap.Count > 0)
+            {
+                foreach (var el in timing.Descendants().ToList())
+                {
+                    foreach (var attr in el.GetAttributes().ToList())
+                    {
+                        if (attr.LocalName != "spid" || !string.IsNullOrEmpty(attr.NamespaceUri)) continue;
+                        if (uint.TryParse(attr.Value, out var spid)
+                            && shapeIdRemap.TryGetValue(spid, out var mappedSpid))
+                            el.SetAttribute(new OpenXmlAttribute(attr.Prefix, attr.LocalName, attr.NamespaceUri, mappedSpid.ToString()));
+                    }
+                }
+            }
         }
 
         // 4. Copy all referenced parts (images, charts, embedded objects, media)
@@ -1886,7 +1922,58 @@ public partial class PowerPointHandler
             catch { }
         }
 
+        // Video, audio and p14:media reach their MediaDataPart through
+        // DataPartReferenceRelationships — a collection separate from Parts,
+        // so the loop above never sees them and the clone kept r:link /
+        // r:embed ids that only the source slide owns.
+        foreach (var dataRef in source.DataPartReferenceRelationships)
+        {
+            try
+            {
+                var newId = CopyDataPartReference(target, dataRef);
+                if (newId != null && newId != dataRef.Id)
+                    rIdMap[dataRef.Id] = newId;
+            }
+            catch { }
+        }
+
         return rIdMap;
+    }
+
+    /// <summary>
+    /// Re-create one media reference (video / audio / p14:media) on
+    /// <paramref name="target"/>, pointing at the same shared MediaDataPart.
+    /// Media data is read-only after creation, so sharing is as safe as it is
+    /// for images. An existing reference of the same kind to the same data
+    /// part is reused; otherwise the source id is kept when it is free so the
+    /// copied XML stays valid without a rewrite. Returns the id to use, or
+    /// null for a reference kind this copier does not know.
+    /// </summary>
+    private static string? CopyDataPartReference(OpenXmlPartContainer target, DataPartReferenceRelationship dataRef)
+    {
+        if (dataRef.DataPart is not MediaDataPart media) return null;
+
+        var existing = target.DataPartReferenceRelationships
+            .FirstOrDefault(r => r.GetType() == dataRef.GetType() && ReferenceEquals(r.DataPart, media));
+        if (existing != null) return existing.Id;
+
+        var idFree = !target.Parts.Any(p => p.RelationshipId == dataRef.Id)
+            && !target.ExternalRelationships.Any(r => r.Id == dataRef.Id)
+            && !target.HyperlinkRelationships.Any(r => r.Id == dataRef.Id)
+            && !target.DataPartReferenceRelationships.Any(r => r.Id == dataRef.Id);
+        var id = idFree ? dataRef.Id : null;
+
+        // The SDK declares these per concrete part type (no container-level
+        // overload); NotesSlidePart has no p14:media reference.
+        return (target, dataRef) switch
+        {
+            (SlidePart sp, VideoReferenceRelationship) => id != null ? sp.AddVideoReferenceRelationship(media, id).Id : sp.AddVideoReferenceRelationship(media).Id,
+            (SlidePart sp, AudioReferenceRelationship) => id != null ? sp.AddAudioReferenceRelationship(media, id).Id : sp.AddAudioReferenceRelationship(media).Id,
+            (SlidePart sp, MediaReferenceRelationship) => id != null ? sp.AddMediaReferenceRelationship(media, id).Id : sp.AddMediaReferenceRelationship(media).Id,
+            (NotesSlidePart np, VideoReferenceRelationship) => id != null ? np.AddVideoReferenceRelationship(media, id).Id : np.AddVideoReferenceRelationship(media).Id,
+            (NotesSlidePart np, AudioReferenceRelationship) => id != null ? np.AddAudioReferenceRelationship(media, id).Id : np.AddAudioReferenceRelationship(media).Id,
+            _ => null,
+        };
     }
 
     /// <summary>
@@ -1908,6 +1995,12 @@ public partial class PowerPointHandler
                 => cdp.AddNewPart<DocumentFormat.OpenXml.Packaging.ChartPart>(),
             DocumentFormat.OpenXml.Packaging.ExtendedChartPart
                 when parent is SlidePart sp2 => sp2.AddNewPart<DocumentFormat.OpenXml.Packaging.ExtendedChartPart>(),
+            DocumentFormat.OpenXml.Packaging.UserDefinedTagsPart
+                when parent is SlidePart spT => spT.AddNewPart<DocumentFormat.OpenXml.Packaging.UserDefinedTagsPart>(),
+            DocumentFormat.OpenXml.Packaging.ChartStylePart
+                => parent.AddNewPart<DocumentFormat.OpenXml.Packaging.ChartStylePart>(),
+            DocumentFormat.OpenXml.Packaging.ChartColorStylePart
+                => parent.AddNewPart<DocumentFormat.OpenXml.Packaging.ChartColorStylePart>(),
             DocumentFormat.OpenXml.Packaging.EmbeddedPackagePart
                 => parent.AddNewPart<DocumentFormat.OpenXml.Packaging.EmbeddedPackagePart>(source.ContentType),
             DocumentFormat.OpenXml.Packaging.EmbeddedObjectPart
@@ -1940,6 +2033,16 @@ public partial class PowerPointHandler
     private static bool NeedsDeepCopy(OpenXmlPart part) => part is
         DocumentFormat.OpenXml.Packaging.ChartPart
         or DocumentFormat.OpenXml.Packaging.ExtendedChartPart
+        // A chart's style / colour parts belong to that chart: PowerPoint
+        // refuses to open a deck in which two chart parts point at the same
+        // style1.xml / colors1.xml (0x80070570, verified), and a chartEx
+        // without its own copies cannot be opened at all.
+        or DocumentFormat.OpenXml.Packaging.ChartStylePart
+        or DocumentFormat.OpenXml.Packaging.ChartColorStylePart
+        // A shape's tags part (p:custDataLst/p:tags, written by add-ins) is
+        // per-shape: PowerPoint refuses a deck where two shapes reference one
+        // tags part (verified), so a clone gets its own copy.
+        or DocumentFormat.OpenXml.Packaging.UserDefinedTagsPart
         or DocumentFormat.OpenXml.Packaging.EmbeddedPackagePart
         or DocumentFormat.OpenXml.Packaging.EmbeddedObjectPart
         or DocumentFormat.OpenXml.Packaging.DiagramDataPart
@@ -1979,6 +2082,46 @@ public partial class PowerPointHandler
                 }
             }
             catch { /* best-effort copy */ }
+        }
+        // External relationships travel with the part too: a chart whose data
+        // lives in a linked workbook carries an oleObject relationship with
+        // TargetMode="External" that <c:externalData r:id> points at. Dropping
+        // it left the clone with a dangling r:id (validator error, "Edit Data"
+        // lost in PowerPoint). Keep the source id where it is free so the XML
+        // reference stays valid without a rewrite.
+        foreach (var extRel in source.ExternalRelationships)
+        {
+            try
+            {
+                var newId = target.AddExternalRelationship(extRel.RelationshipType, extRel.Uri, extRel.Id).Id;
+                if (newId != extRel.Id) subRIdMap[extRel.Id] = newId;
+            }
+            catch
+            {
+                try
+                {
+                    var newId = target.AddExternalRelationship(extRel.RelationshipType, extRel.Uri).Id;
+                    subRIdMap[extRel.Id] = newId;
+                }
+                catch { /* best-effort copy */ }
+            }
+        }
+        foreach (var hyperRel in source.HyperlinkRelationships)
+        {
+            try
+            {
+                var newId = target.AddHyperlinkRelationship(hyperRel.Uri, hyperRel.IsExternal, hyperRel.Id).Id;
+                if (newId != hyperRel.Id) subRIdMap[hyperRel.Id] = newId;
+            }
+            catch
+            {
+                try
+                {
+                    var newId = target.AddHyperlinkRelationship(hyperRel.Uri, hyperRel.IsExternal).Id;
+                    subRIdMap[hyperRel.Id] = newId;
+                }
+                catch { /* best-effort copy */ }
+            }
         }
         if (subRIdMap.Count > 0)
         {
@@ -2117,6 +2260,23 @@ public partial class PowerPointHandler
                     handled = true;
                 }
                 catch (ArgumentOutOfRangeException) { /* Not a part-based relationship */ }
+
+                if (!handled)
+                {
+                    // Video / audio / p14:media: GetPartById throws for these
+                    // because they live in DataPartReferenceRelationships.
+                    var dataRef = sourcePart.DataPartReferenceRelationships.FirstOrDefault(r => r.Id == oldRelId);
+                    if (dataRef != null)
+                    {
+                        var newDRelId = CopyDataPartReference(targetPart, dataRef);
+                        if (newDRelId != null)
+                        {
+                            if (newDRelId != oldRelId)
+                                el.SetAttribute(new OpenXmlAttribute(attr.Prefix, attr.LocalName, attr.NamespaceUri, newDRelId));
+                            handled = true;
+                        }
+                    }
+                }
 
                 if (!handled)
                 {

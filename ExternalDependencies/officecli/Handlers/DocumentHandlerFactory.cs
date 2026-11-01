@@ -290,7 +290,7 @@ public static class DocumentHandlerFactory
             ".xlsx" or ".xlsm" => new ExcelHandler(filePath, editable),
             ".pptx" or ".pptm" => new PowerPointHandler(filePath, editable),
             _      => TryOpenViaPlugin(filePath, ext, editable)
-                   ?? throw UnsupportedTypeException(ext)
+                   ?? throw PluginRejectedOrUnsupported(ext)
         };
     }
 
@@ -393,6 +393,24 @@ public static class DocumentHandlerFactory
             catch (IOException ex) { last = ex; Thread.Sleep(150 * (attempt + 1)); }
         }
         throw last!;
+    }
+
+    // A plugin that exists but was refused for its protocol major is a
+    // different failure from "no plugin handles this extension": the user has
+    // something installed and needs a matching plugin build, not an install.
+    // plugins/plugin-protocol.md §6.6 names this protocol_mismatch.
+    private static CliException PluginRejectedOrUnsupported(string ext)
+    {
+        foreach (var kind in new[] { PluginKind.DumpReader, PluginKind.FormatHandler })
+        {
+            if (PluginRegistry.TryGetProtocolRejection(kind, ext, out var path, out var declared))
+                return new CliException(
+                    $"Plugin at {path} declares protocol={declared} but this officecli supports " +
+                    $"protocol={PluginRegistry.SupportedProtocolVersion}; it was not loaded, so {ext} stays unsupported. " +
+                    $"Install a plugin build for protocol {PluginRegistry.SupportedProtocolVersion}.")
+                { Code = "protocol_mismatch" };
+        }
+        return UnsupportedTypeException(ext);
     }
 
     private static CliException UnsupportedTypeException(string ext) =>

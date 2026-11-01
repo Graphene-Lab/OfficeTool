@@ -59,6 +59,7 @@ public partial class PowerPointHandler
                 {
                     XmlTextValidator.ValidateOrThrow(titleText, "title");
                     var titleShape = CreateTextShape(nextShapeId++, "Title", titleText, true);
+                    FitAddedTextShapeToLayout(titleShape, slideLayoutPart, isTitle: true);
                     newSlidePart.Slide.CommonSlideData!.ShapeTree!.AppendChild(titleShape);
                 }
 
@@ -74,6 +75,7 @@ public partial class PowerPointHandler
                     // phType=body) instead of mismatched title vs bare textbox.
                     var textShape = CreateTextShape(nextShapeId++, "Content", contentText, false, isTextBox: true,
                         placeholderType: PlaceholderValues.Body, placeholderIndex: 1);
+                    FitAddedTextShapeToLayout(textShape, slideLayoutPart, isTitle: false);
                     newSlidePart.Slide.CommonSlideData!.ShapeTree!.AppendChild(textShape);
                 }
 
@@ -146,4 +148,84 @@ public partial class PowerPointHandler
     }
 
 
+
+    /// <summary>
+    /// The title/text shapes that <c>add --type slide</c> emits start with the
+    /// fixed geometry of a 13.33in × 7.5in slide. Bind them to the slide's
+    /// real environment: when the layout (or its master) defines a matching
+    /// placeholder — title family for the title, body/subtitle/object family
+    /// for the text — adopt that placeholder's type, idx and frame, exactly
+    /// as PowerPoint fills a layout slot; otherwise scale the default frame
+    /// to the slide size so it never runs past the edge on a 4:3 or 10in deck.
+    /// </summary>
+    private void FitAddedTextShapeToLayout(Shape shape, SlideLayoutPart? layoutPart, bool isTitle)
+    {
+        var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
+            ?.GetFirstChild<PlaceholderShape>();
+        var xfrm = shape.ShapeProperties?.Transform2D;
+        if (xfrm?.Offset == null || xfrm.Extents == null) return;
+        var (slideW, slideH) = GetSlideSize();
+
+        var layoutPh = FindPlaceholderByFamily(layoutPart?.SlideLayout?.CommonSlideData?.ShapeTree, isTitle);
+        if (layoutPh != null)
+        {
+            var lph = layoutPh.NonVisualShapeProperties!.ApplicationNonVisualDrawingProperties!
+                .GetFirstChild<PlaceholderShape>()!;
+            if (ph != null)
+            {
+                if (lph.Type?.HasValue == true) ph.Type = lph.Type.Value;
+                if (lph.Index?.HasValue == true) ph.Index = lph.Index.Value;
+                else ph.Index = null;
+            }
+            var frame = layoutPh.ShapeProperties?.Transform2D;
+            if (frame?.Offset == null || frame.Extents == null)
+            {
+                // Layout inherits the frame from the master's placeholder of the same family.
+                var masterPh = FindPlaceholderByFamily(
+                    layoutPart?.SlideMasterPart?.SlideMaster?.CommonSlideData?.ShapeTree, isTitle);
+                frame = masterPh?.ShapeProperties?.Transform2D;
+            }
+            // A layout slot that itself runs past the slide (a deck whose
+            // slideSize was changed without rescaling its layouts) is no
+            // better than the fixed default — fall through to scaling then.
+            if (frame?.Offset != null && frame.Extents != null
+                && frame.Offset.X!.Value + frame.Extents.Cx!.Value <= slideW
+                && frame.Offset.Y!.Value + frame.Extents.Cy!.Value <= slideH)
+            {
+                xfrm.Offset!.X = frame.Offset.X;
+                xfrm.Offset.Y = frame.Offset.Y;
+                xfrm.Extents!.Cx = frame.Extents.Cx;
+                xfrm.Extents.Cy = frame.Extents.Cy;
+                return;
+            }
+        }
+
+        if (slideW == SlideSizeDefaults.Widescreen16x9Cx && slideH == SlideSizeDefaults.Widescreen16x9Cy) return;
+        var sx = slideW / (double)SlideSizeDefaults.Widescreen16x9Cx;
+        var sy = slideH / (double)SlideSizeDefaults.Widescreen16x9Cy;
+        // Keep the result pt-exact (multiples of 12700 EMU) so Get reads back
+        // unit-qualified values rather than raw EMU.
+        static long Scale(long emu, double f) => (long)Math.Round(emu * f / 12700.0) * 12700L;
+        xfrm.Offset!.X = Scale(xfrm.Offset.X!.Value, sx);
+        xfrm.Offset.Y = Scale(xfrm.Offset.Y!.Value, sy);
+        xfrm.Extents!.Cx = Scale(xfrm.Extents.Cx!.Value, sx);
+        xfrm.Extents.Cy = Scale(xfrm.Extents.Cy!.Value, sy);
+    }
+
+    private static Shape? FindPlaceholderByFamily(ShapeTree? tree, bool isTitle)
+    {
+        if (tree == null) return null;
+        foreach (var sp in tree.Elements<Shape>())
+        {
+            var ph = sp.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
+                ?.GetFirstChild<PlaceholderShape>();
+            if (ph == null) continue;
+            var t = ph.Type?.HasValue == true ? ph.Type.Value : PlaceholderValues.Object;
+            var match = isTitle
+                ? t == PlaceholderValues.Title || t == PlaceholderValues.CenteredTitle
+                : t == PlaceholderValues.Body || t == PlaceholderValues.SubTitle || t == PlaceholderValues.Object;
+            if (match) return sp;
+        }
+        return null;
+    }
 }

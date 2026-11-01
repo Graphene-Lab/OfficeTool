@@ -538,7 +538,7 @@ internal static partial class PivotTableHelper
         // numeric nor regular strings; they will be emitted as ErrorItem elements.
         bool valuesAreNumeric = values.Length > 0 && values.All(v =>
             string.IsNullOrEmpty(v) || v == ErrorCellSentinel
-            || double.TryParse(v, System.Globalization.CultureInfo.InvariantCulture, out _));
+            || NumericText.TryParse(v, out _));
         // When forceStringIndexed is true (axis fields), report isNumeric=false
         // so downstream record-writing code uses the valueIndex map to emit
         // <x v="N"/> references instead of <n v="..."/> direct values. The
@@ -899,7 +899,7 @@ internal static partial class PivotTableHelper
                 {
                     record.AppendChild(new NumberItem
                     {
-                        Val = double.Parse(v, System.Globalization.CultureInfo.InvariantCulture)
+                        Val = NumericText.TryParse(v, out var nv) ? nv : 0
                     });
                 }
                 else if (fieldValueIndex[f].TryGetValue(v, out var idx))

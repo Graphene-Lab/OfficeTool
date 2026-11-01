@@ -129,19 +129,20 @@
     },
     "font.color": {
       "type": "color",
-      "description": "font color on the cell. Note: the bare 'color' alias is intentionally rejected on cells due to ambiguity with 'fill' (background) — use 'font.color' explicitly.",
+      "description": "font color on the cell. Note: the bare 'color' alias is intentionally rejected on cells due to ambiguity with 'fill' (background) — use 'font.color' explicitly. Accepts scheme color names with an optional tint suffix (e.g. accent1, dk2+tint60).",
       "add": true,
       "set": true,
       "get": true,
       "examples": [
-        "--prop font.color=FF0000"
+        "--prop font.color=FF0000",
+        "--prop font.color=dk2+tint60"
       ],
-      "readback": "#RRGGBB uppercase",
+      "readback": "#RRGGBB uppercase, or scheme color name with any tint suffix (e.g. dk2+tint60)",
       "enforcement": "report"
     },
     "fill": {
       "type": "color",
-      "description": "cell background fill. Solid color (hex / named / rgb(...)), a scheme color name (accent1-accent6, lt1/dk1, lt2/dk2, hlink...) stored as a theme reference, or a linear gradient as 'COLOR1-COLOR2[-ANGLE]' / 'gradient;COLOR1;COLOR2[;ANGLE]'. On a cell that already carries a non-solid pattern fill, a lone fill= updates the pattern's foreground color (pattern and background are kept).",
+      "description": "cell background fill. Solid color (hex / named / rgb(...)), a scheme color name (accent1-accent6, lt1/dk1, lt2/dk2, hlink...) stored as a theme reference, or a linear gradient as 'COLOR1-COLOR2[-ANGLE]' / 'gradient;COLOR1;COLOR2[;ANGLE]'. On a cell that already carries a non-solid pattern fill, a lone fill= updates the pattern's foreground color (pattern and background are kept). A scheme color may carry an optional lightening/darkening tint suffix ('accent1+tint40' = Excel's \"Accent1, Lighter 40%\"; negative darkens, e.g. 'dk2+tint-25'). The tint is part of the color's identity — an untinted 'accent1' never reuses a tinted swatch.",
       "aliases": [
         "bgcolor"
       ],
@@ -153,9 +154,10 @@
         "--prop fill=#FF0000",
         "--prop fill=red",
         "--prop fill=\"FF0000-0000FF-90\"",
-        "--prop fill=\"gradient;FF0000;0000FF;90\""
+        "--prop fill=\"gradient;FF0000;0000FF;90\"",
+        "--prop fill=accent1+tint40"
       ],
-      "readback": "#RRGGBB uppercase, 'gradient;#START;#END;ANGLE' for gradients, scheme color name (e.g. accent1) when set externally",
+      "readback": "#RRGGBB uppercase, 'gradient;#START;#END;ANGLE' for gradients, scheme color name with any tint suffix (e.g. accent1, accent1+tint40)",
       "enforcement": "report"
     },
     "fillPattern": {
@@ -193,7 +195,7 @@
     },
     "fillBg": {
       "type": "color",
-      "description": "background color of a non-solid pattern fill (see fillPattern). Ignored for solid fills.",
+      "description": "background color of a non-solid pattern fill (see fillPattern). Ignored for solid fills. Accepts scheme color names with an optional tint suffix.",
       "add": true,
       "set": true,
       "get": true,
@@ -282,12 +284,15 @@
     },
     "phonetic": {
       "type": "string",
-      "description": "phonetic guide text from SST PhoneticRun. Emitted only when present.",
-      "add": false,
-      "set": false,
+      "description": "phonetic guide text (furigana / CJK ruby) carried as the shared string's <rPh> run. Setting it promotes the cell's base text into the shared-string table and stamps a single reading spanning the whole text; the worksheet's default <phoneticPr> is created if absent.",
+      "add": true,
+      "set": true,
       "get": true,
       "readback": "phonetic string",
-      "enforcement": "report"
+      "enforcement": "report",
+      "examples": [
+        "--prop phonetic=コウモク"
+      ]
     },
     "quotePrefix": {
       "type": "bool",

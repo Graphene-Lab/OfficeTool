@@ -1077,6 +1077,7 @@ public partial class WordHandler
             // the body walk) so a cell's list continues document-flow numbering
             // 1./2./3. instead of restarting at the level start on every item.
             var seedAbsId = GetAbstractNumId(numId);
+            EnterOrderedNum(olState, numId);
             AdvanceOrderedCounter(olState, numId, seedAbsId, ilvl);
             var marker = RenderOrderedMarker(olState, numId, ilvl, lvlText);
             var suff = GetLevelSuffix(numId, ilvl);

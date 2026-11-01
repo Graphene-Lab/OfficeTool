@@ -14,7 +14,17 @@ public partial class PowerPointHandler
 {
     public List<string> Set(string path, Dictionary<string, string> properties)
     {
-        Modified = true;
+        // A set that applied nothing (every prop unsupported) is a no-op and
+        // must not mark the document modified — it used to rewrite the file.
+        LastSelectorSetCount = 0;
+        var wasModified = Modified;
+        var unsupported = MarkModified(() => SetCore(path, properties));
+        if (properties.Count > 0 && unsupported.Count >= properties.Count) Modified = wasModified;
+        return unsupported;
+    }
+
+    private List<string> SetCore(string path, Dictionary<string, string> properties)
+    {
         LastUnrecognizedLatex = new List<string>();
         path = NormalizePptxPathSegmentCasing(path);
         path = NormalizeCellPath(path);
@@ -42,13 +52,13 @@ public partial class PowerPointHandler
                 path, Query, keyResolver: null, applyAll: false);
             if (targets.Count == 0)
                 throw new ArgumentException($"No elements matched selector: {path}");
-            LastSelectorSetCount = targets.Count;
             foreach (var target in targets)
             {
                 var targetUnsupported = Set(target.Path, properties);
                 foreach (var u in targetUnsupported)
                     if (!unsupported.Contains(u)) unsupported.Add(u);
             }
+            LastSelectorSetCount = targets.Count; // after the per-target calls, which reset it
             return unsupported;
         }
 

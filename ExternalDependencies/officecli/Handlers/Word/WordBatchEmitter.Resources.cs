@@ -3760,7 +3760,6 @@ public static partial class WordBatchEmitter
         try { sdkNum = new DocumentFormat.OpenXml.Wordprocessing.Numbering(numberingXml); }
         catch { return null; }
         var ops = new List<BatchItem>();
-        var counts = new Dictionary<string, int>(StringComparer.Ordinal);
         var xChildren = numEl.Elements().ToList();
         var sdkChildren = sdkNum.Elements().ToList();
         if (xChildren.Count != sdkChildren.Count) return null;
@@ -3769,9 +3768,13 @@ public static partial class WordBatchEmitter
             var child = xChildren[i];
             var sdkChild = sdkChildren[i];
             if (child.Name.LocalName != sdkChild.LocalName) return null;
-            counts.TryGetValue(child.Name.LocalName, out var c);
-            counts[child.Name.LocalName] = c + 1;
-            var childPath = $"/numbering/{child.Name.LocalName}[{c + 1}]";
+            // Address the definition just added via [last()], mirroring the
+            // /body/p[last()] convention — NOT by source position. A source-
+            // positional path (/numbering/abstractNum[1]) resolves to the
+            // TARGET's own first definition when the target already has
+            // numbering (cross-document replay), so the source levels were
+            // appended into the target's list and changed its format.
+            var childPath = $"/numbering/{child.Name.LocalName}[last()]";
             if (!TryEmitElementAdd(child, sdkChild, "/numbering", childPath, ops, 0))
                 return null;
         }

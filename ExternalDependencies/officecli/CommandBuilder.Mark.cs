@@ -46,7 +46,14 @@ static partial class CommandBuilder
             foreach (var p in rawProps)
             {
                 var eq = p.IndexOf('=');
-                if (eq <= 0) continue;
+                if (eq <= 0)
+                {
+                    // Same rules as ParsePropsArray: a token --prop swallowed
+                    // that is not key=value is an error, never a silent drop.
+                    if (p.StartsWith("--") && p.Length > 2)
+                        throw new OfficeCli.Core.CliException($"Unrecognized option '{p}'.") { Code = "invalid_argument" };
+                    throw new OfficeCli.Core.CliException($"Invalid --prop '{p}': expected key=value.") { Code = "invalid_argument" };
+                }
                 var key = p[..eq];
                 var val = p[(eq + 1)..];
 

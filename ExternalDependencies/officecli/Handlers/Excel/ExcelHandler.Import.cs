@@ -18,14 +18,39 @@ public partial class ExcelHandler
     /// <param name="delimiter">Field delimiter: ',' for CSV, '\t' for TSV</param>
     /// <param name="hasHeader">If true, set AutoFilter and freeze pane on first row</param>
     /// <param name="startCell">Starting cell reference, e.g. "A1"</param>
+    /// <param name="decimalSeparator">Decimal mark the SOURCE uses: '.' (default)
+    /// or ',' for the de-DE / ru-RU spelling, where '.' becomes the thousands
+    /// group. Declared by the caller — never detected (see Core.NumericText).</param>
     /// <returns>Summary of rows/cols imported</returns>
-    public string Import(string parentPath, string csvContent, char delimiter, bool hasHeader, string startCell)
+    public string Import(string parentPath, string csvContent, char delimiter, bool hasHeader, string startCell,
+        char decimalSeparator = '.')
     {
         parentPath = NormalizeExcelPath(parentPath);
         parentPath = ResolveSheetIndexInPath(parentPath);
-        var sheetName = parentPath.TrimStart('/').Split('/', 2)[0];
+        var pathSegments = parentPath.TrimStart('/').Split('/', 2);
+        var sheetName = pathSegments[0];
         var worksheet = FindWorksheet(sheetName)
             ?? throw new ArgumentException($"Sheet not found: {sheetName}");
+
+        // A cell-qualified target (/Sheet1/D3) is the same address every other
+        // xlsx verb takes, so it names the top-left landing cell. It used to be
+        // cut off after the sheet segment without a word, and the matrix landed
+        // on A1 over whatever was there. Anything that is not a single cell —
+        // a range, a row/col locator, a typo — is refused rather than guessed.
+        if (pathSegments.Length > 1 && pathSegments[1].Length > 0)
+        {
+            var cellSeg = pathSegments[1].Replace("$", "").ToUpperInvariant();
+            if (!System.Text.RegularExpressions.Regex.IsMatch(cellSeg, @"^[A-Z]{1,3}[1-9]\d*$"))
+                throw new Core.CliException(
+                    $"import target '{parentPath}' must be a sheet (/{sheetName}) or a single cell (/{sheetName}/A1); '{pathSegments[1]}' is neither.")
+                { Code = "invalid_path", Suggestion = $"Use /{sheetName}/{{top-left cell}} or --start-cell." };
+            if (!string.Equals(startCell, "A1", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(startCell, cellSeg, StringComparison.OrdinalIgnoreCase))
+                throw new Core.CliException(
+                    $"import target '{parentPath}' names cell {cellSeg} but --start-cell says {startCell}; pass one or make them agree.")
+                { Code = "invalid_argument" };
+            startCell = cellSeg;
+        }
 
         var ws = GetSheet(worksheet);
         var sheetData = ws.GetFirstChild<SheetData>()
@@ -34,6 +59,15 @@ public partial class ExcelHandler
         // Parse start cell
         var (startCol, startRow) = ParseCellReference(startCell.ToUpperInvariant());
         var startColIdx = ColumnNameToIndex(startCol);
+
+        // Excel's `sep=X` first line is a declaration, not a row. Strip it
+        // whatever the caller chose as the delimiter: left in place it becomes a
+        // junk first row that shifts every real row down one, so hasHeader
+        // freezes and auto-filters the wrong line. Which separator to USE is the
+        // caller's call (an explicit --delimiter still wins) — see
+        // Core.CsvSepDeclaration.
+        if (Core.CsvSepDeclaration.TryRead(csvContent, out _, out var withoutSepLine))
+            csvContent = withoutSepLine;
 
         // Parse CSV
         var rows = ParseCsv(csvContent, delimiter);
@@ -146,7 +180,8 @@ public partial class ExcelHandler
                     cell.CellValue = null;
                     cell.DataType = null;
                 }
-                if (SetCellValueWithTypeDetection(cell, fields[c], IsWorkbookDate1904()))
+                if (SetCellValueWithTypeDetection(cell, fields[c], IsWorkbookDate1904(), decimalSeparator,
+                        keepAsText: CellCarriesTextFormat(cell)))
                 {
                     // Date cell — apply a date number format so it shows as a
                     // date, not the raw serial. Mirrors Set/Add (numFmt yyyy-mm-dd).
@@ -237,6 +272,12 @@ public partial class ExcelHandler
             sheetView.InsertAt(pane, 0);
         }
 
+        // Mark the document modified so Dispose flushes it. Without this, an
+        // `import` with no explicit Save (the CLI path) hits the !Modified
+        // byte-preserving discard branch in Dispose and the imported rows are
+        // silently dropped — success reported, disk unchanged. Same gap that
+        // affected Move/Swap/CopyFrom.
+        Modified = true;
         SaveWorksheet(worksheet);
         return $"Imported {rows.Count} rows x {maxCols} cols into /{sheetName} starting at {startCell.ToUpperInvariant()}";
     }
@@ -247,7 +288,32 @@ public partial class ExcelHandler
     /// </summary>
     /// <returns>true when the value was stored as a DATE (serial number needing
     /// a date number format); false for every other type.</returns>
-    private static bool SetCellValueWithTypeDetection(Cell cell, string value, bool date1904)
+    /// <summary>
+    /// True when the (pre-existing) cell is formatted as Text — numFmtId 49 /
+    /// format code "@". Excel keeps whatever is typed into such a cell as a
+    /// literal string, formulas and numbers included; a pre-formatted import
+    /// target must get the same treatment.
+    /// </summary>
+    private bool CellCarriesTextFormat(Cell cell)
+    {
+        if (cell.StyleIndex == null) return false;
+        var (numFmtId, code) = ExcelDataFormatter.GetCellFormat(cell, _doc.WorkbookPart);
+        return numFmtId == 49 || (code != null && code.Trim() == "@");
+    }
+
+    /// <summary>
+    /// The same rule the `set` path applies before treating a digit string as a
+    /// number: an identifier-shaped literal — leading zero (007, 01234) or more
+    /// digits than a double can carry (>15) — is text. Storing it numeric drops
+    /// the zeros / rounds the tail in every consumer, and nothing can bring
+    /// them back; the reverse (type=number on a text cell) is always available.
+    /// </summary>
+    private static bool LooksLikeIdentifierNotNumber(string value)
+        => value.Length > 1 && value.All(char.IsDigit)
+           && (value[0] == '0' || value.Length > 15);
+
+    private static bool SetCellValueWithTypeDetection(Cell cell, string value, bool date1904,
+        char decimalSeparator = '.', bool keepAsText = false)
     {
         // Empty
         if (string.IsNullOrEmpty(value))
@@ -262,6 +328,15 @@ public partial class ExcelHandler
         // file Excel refuses to open.
         EnsureCellValueLength(value, cell.CellReference?.Value);
 
+        // Text-formatted target, or a literal that only reads correctly as
+        // text: store verbatim, no formula/number/date detection.
+        if (keepAsText || LooksLikeIdentifierNotNumber(value))
+        {
+            cell.CellValue = new CellValue(value);
+            cell.DataType = new EnumValue<CellValues>(CellValues.String);
+            return false;
+        }
+
         // Formula: starts with =
         if (value.StartsWith('='))
         {
@@ -274,8 +349,15 @@ public partial class ExcelHandler
             return false;
         }
 
-        // Number (integer or decimal)
-        if (double.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var numVal)
+        // Number (integer or decimal). Which spellings count is Core.NumericText's
+        // call: by default "1,5" is NOT a number (AllowThousands would read it as
+        // 15, silently 10x-ing every decimal-comma value in a de-DE / ru-RU CSV);
+        // under a declared decimal comma it is rewritten to 1.5 instead.
+        string? numericText = decimalSeparator == ','
+            ? (Core.NumericText.TryRewriteCommaDecimal(value, out var rewritten) ? rewritten : null)
+            : (HasValidThousandsGrouping(value) ? value : null);
+        if (numericText != null
+            && double.TryParse(numericText, NumberStyles.Any, CultureInfo.InvariantCulture, out var numVal)
             && double.IsFinite(numVal)) // "Infinity"/"NaN" parse but have no OOXML numeric form — fall through to string
         {
             // Preserve the literal digits when the input is already a plain
@@ -285,7 +367,7 @@ public partial class ExcelHandler
             // would corrupt them. Normalization is kept for the non-canonical
             // spellings double.TryParse accepts (whitespace padding,
             // thousands separators, "Infinity"/"NaN").
-            cell.CellValue = new CellValue(NormalizeNumericCellText(value, numVal));
+            cell.CellValue = new CellValue(NormalizeNumericCellText(numericText, numVal));
             cell.DataType = null; // numeric is default
             return false;
         }

@@ -439,14 +439,12 @@ internal static class TemplateMerger
         foreach (var slidePart in presentationPart.SlideParts)
         {
             // Process shapes on slide
+            // Every a:p under the shape tree: top-level shapes, table cells
+            // (p:graphicFrame/a:tbl/a:tr/a:tc/a:txBody) and shapes nested in
+            // groups. Mirrors the docx walk over body.Descendants<Paragraph>.
             var shapeTree = slidePart.Slide?.CommonSlideData?.ShapeTree;
             if (shapeTree != null)
-            {
-                foreach (var shape in shapeTree.Elements<Shape>())
-                {
-                    totalReplacements += ReplaceInTextBody(shape.TextBody, data, usedKeys);
-                }
-            }
+                totalReplacements += ReplaceInTree(shapeTree, data, usedKeys);
 
             // Process notes
             var notesPart = slidePart.NotesSlidePart;
@@ -454,12 +452,7 @@ internal static class TemplateMerger
             {
                 var notesShapeTree = notesPart.NotesSlide?.CommonSlideData?.ShapeTree;
                 if (notesShapeTree != null)
-                {
-                    foreach (var shape in notesShapeTree.Elements<Shape>())
-                    {
-                        totalReplacements += ReplaceInTextBody(shape.TextBody, data, usedKeys);
-                    }
-                }
+                    totalReplacements += ReplaceInTree(notesShapeTree, data, usedKeys);
                 notesPart.NotesSlide?.Save();
             }
 
@@ -472,16 +465,11 @@ internal static class TemplateMerger
         return new MergeResult(totalReplacements, unresolved, usedKeys.ToList());
     }
 
-    private static int ReplaceInTextBody(OpenXmlElement? textBody, Dictionary<string, string> data, HashSet<string> usedKeys)
+    private static int ReplaceInTree(OpenXmlElement tree, Dictionary<string, string> data, HashSet<string> usedKeys)
     {
-        if (textBody == null) return 0;
         int replacements = 0;
-
-        foreach (var para in textBody.Elements<Drawing.Paragraph>())
-        {
+        foreach (var para in tree.Descendants<Drawing.Paragraph>().ToList())
             replacements += ReplaceInParagraph(para, data, usedKeys);
-        }
-
         return replacements;
     }
 
@@ -529,35 +517,24 @@ internal static class TemplateMerger
         {
             var shapeTree = slidePart.Slide?.CommonSlideData?.ShapeTree;
             if (shapeTree != null)
-            {
-                foreach (var shape in shapeTree.Elements<Shape>())
-                {
-                    ScanTextBody(shape.TextBody, unresolved);
-                }
-            }
+                ScanTree(shapeTree, unresolved);
 
             var notesPart = slidePart.NotesSlidePart;
             if (notesPart != null)
             {
                 var notesShapeTree = notesPart.NotesSlide?.CommonSlideData?.ShapeTree;
                 if (notesShapeTree != null)
-                {
-                    foreach (var shape in notesShapeTree.Elements<Shape>())
-                    {
-                        ScanTextBody(shape.TextBody, unresolved);
-                    }
-                }
+                    ScanTree(notesShapeTree, unresolved);
             }
         }
 
         return unresolved.OrderBy(x => x).ToList();
     }
 
-    private static void ScanTextBody(OpenXmlElement? textBody, HashSet<string> unresolved)
+    /// <summary>Same walk as ReplaceInTree, so replacement and the unresolved report never disagree.</summary>
+    private static void ScanTree(OpenXmlElement tree, HashSet<string> unresolved)
     {
-        if (textBody == null) return;
-
-        foreach (var para in textBody.Elements<Drawing.Paragraph>())
+        foreach (var para in tree.Descendants<Drawing.Paragraph>())
         {
             var text = string.Concat(para.Elements<Drawing.Run>().Select(r => r.Text?.Text ?? ""));
             foreach (Match match in PlaceholderPattern.Matches(text))

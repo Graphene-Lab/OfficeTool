@@ -10,9 +10,9 @@ compiles into its own `officecli.dll`, without the CLI shell.
 | Field | Value |
 |---|---|
 | Upstream repository | https://github.com/iOfficeAI/OfficeCLI |
-| Upstream version | v1.0.144 |
-| Upstream commit | 1ced45e900782c5083ed550ddf328ee974e425e7 |
-| Sync date | 2026-08-15 |
+| Upstream version | v1.0.160 |
+| Upstream commit | c56512c8c7b76fe284f09940e4cd492470099d3e |
+| Sync date | 2026-11-01 |
 | Upstream license | Apache-2.0 (see NOTICE.md) |
 
 > The sync pipeline updates the *version*, *commit* and *date* rows above

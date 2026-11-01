@@ -62,7 +62,7 @@ internal static class AtomicPackageWriter
             // and fsync-flushed, so this is just as crash-safe as the replace,
             // and the session's managed path (`path`) is what gets the data.
             if (File.Exists(path))
-                File.Replace(tmp, path, destinationBackupFileName: null);
+                ReplaceFile(tmp, path);
             else
                 File.Move(tmp, path);
         }
@@ -78,6 +78,29 @@ internal static class AtomicPackageWriter
             // threw, so the session can retry the flush on the still-intact
             // original at the next save/close.
             if (released) { try { reopenLock(); } catch { /* next flush resurfaces it */ } }
+        }
+    }
+
+    /// <summary>
+    /// Atomically swap <paramref name="tmp"/> over the existing
+    /// <paramref name="path"/>. Windows ReplaceFile is refused with
+    /// ERROR_ACCESS_DENIED under a restricted-token sandbox even when the
+    /// process holds Full Control on both files and the directory, while a
+    /// MoveFileEx(MOVEFILE_REPLACE_EXISTING) in the same context succeeds
+    /// (#493). Fall back to that move — still a same-volume atomic rename,
+    /// only without ReplaceFile's ACL/attribute carry-over. A genuinely
+    /// unwritable target makes the move fail too, so the error still surfaces.
+    /// Other platforms keep File.Replace unchanged.
+    /// </summary>
+    public static void ReplaceFile(string tmp, string path)
+    {
+        try
+        {
+            File.Replace(tmp, path, destinationBackupFileName: null);
+        }
+        catch (UnauthorizedAccessException) when (OperatingSystem.IsWindows())
+        {
+            File.Move(tmp, path, overwrite: true);
         }
     }
 }

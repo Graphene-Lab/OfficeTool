@@ -781,8 +781,37 @@ public partial class WordHandler
                     }
                     if (gSizePt <= 0) gSizePt = 12.0;
 
+                    // On a line grid Word treats an "auto" w:line multiplier as a
+                    // multiple of ONE grid pitch (1.5x on a 15.6pt grid is 23.4pt,
+                    // not rounded to whole grid lines), floored by the whole number
+                    // of grid lines the font itself needs. Measured in Word on a
+                    // 312-twip grid with Calibri: 11pt 1.0/1.15/1.5/2.0/3.0x ->
+                    // 15.6/17.9/23.4/31.2/46.8pt; 16pt 1.5x -> 31.2pt; 22pt
+                    // 1.0/1.5/3.0x -> 31.2/31.2/46.8pt.
+                    double lineMult = 1.0;
+                    var gLineVal = pProps.SpacingBetweenLines?.Line?.Value
+                                   ?? styleSpacing?.Line?.Value;
+                    var gRule = pProps.SpacingBetweenLines?.LineRule?.InnerText
+                                ?? styleSpacing?.LineRule?.InnerText;
+                    if ((gRule == "auto" || gRule == null)
+                        && int.TryParse(gLineVal, out var gLvNum) && gLvNum > 0)
+                        lineMult = gLvNum / 240.0;
+
                     double fontHeightPt = gSizePt * gRatio;
-                    double snappedPt = Math.Ceiling(fontHeightPt / gridPitchPt) * gridPitchPt;
+                    double fontFloorPt = Math.Ceiling(fontHeightPt / gridPitchPt) * gridPitchPt;
+                    double snappedPt;
+                    // Measured in Word on a 312-twip grid: an "exact" value is used
+                    // as-is (20pt stays 20pt), "atLeast" is the value floored by the
+                    // grid line the font occupies (10pt -> 15.6pt, 20pt -> 20pt);
+                    // neither is rounded to whole grid lines.
+                    if ((gRule == "exact" || gRule == "atLeast")
+                        && int.TryParse(gLineVal, out var gFixedTwips) && gFixedTwips > 0)
+                    {
+                        double fixedPt = gFixedTwips / 20.0;
+                        snappedPt = gRule == "exact" ? fixedPt : Math.Max(fixedPt, fontFloorPt);
+                    }
+                    else
+                        snappedPt = Math.Max(fontFloorPt, lineMult * gridPitchPt);
                     parts.RemoveAll(p => p.StartsWith("line-height"));
                     parts.Add($"line-height:{snappedPt:0.##}pt");
                 }
@@ -3303,6 +3332,9 @@ public partial class WordHandler
         th, td {{ border: none; padding: 0 5.4pt; text-align: inherit; vertical-align: top; break-inside: auto; overflow-wrap: anywhere; }}
         tr {{ break-inside: auto; }}
         th {{ font-weight: 600; }}
+        /* #342: comments — highlight the commented range + a hover-able marker. */
+        .w-comment-range {{ background: #FFF3CD; border-bottom: 1px dotted #E0A800; }}
+        .w-comment-ref {{ font-size: 0.7em; color: #B8860B; cursor: help; margin: 0 1px; user-select: none; }}
         @media print {{ body {{ background: white; padding: 0; }}
             .page {{ box-shadow: none; margin: 0; max-width: none; transform: none !important; }}
             hr.page-break {{ page-break-after: always; border: none; margin: 0; }} }}";

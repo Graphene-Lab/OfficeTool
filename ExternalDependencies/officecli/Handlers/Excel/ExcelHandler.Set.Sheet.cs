@@ -527,16 +527,24 @@ public partial class ExcelHandler
                         // ("accent1"-"accent6", "lt1", "dk1", ...) by mapping
                         // them to TabColor.Theme index. Otherwise fall back to
                         // the numeric color parser for hex/named/rgb() inputs.
-                        var themeIndex = ExcelSchemeColorNameToThemeIndex(value);
+                        // A `+tintNN` suffix rides along for parity with cell
+                        // fill / font.color ("accent1+tint40").
+                        var (tabBase, tabTint) = OfficeCli.Core.ParseHelpers.SplitExcelColorTint(value);
+                        var themeIndex = ExcelSchemeColorNameToThemeIndex(tabBase);
+                        TabColor tabColor;
                         if (themeIndex.HasValue)
                         {
-                            sheetPr.AppendChild(new TabColor { Theme = (UInt32Value)themeIndex.Value });
+                            tabColor = new TabColor { Theme = (UInt32Value)themeIndex.Value };
                         }
                         else
                         {
-                            var colorHex = OfficeCli.Core.ParseHelpers.NormalizeArgbColor(value);
-                            sheetPr.AppendChild(new TabColor { Rgb = new HexBinaryValue(colorHex) });
+                            var colorHex = OfficeCli.Core.ParseHelpers.NormalizeArgbColor(tabBase);
+                            tabColor = new TabColor { Rgb = new HexBinaryValue(colorHex) };
                         }
+                        if (tabTint is { } tt
+                            && Math.Abs(tt) >= OfficeCli.Core.ParseHelpers.ExcelTintEpsilon)
+                            tabColor.Tint = tt;
+                        sheetPr.AppendChild(tabColor);
                     }
                     break;
                 }

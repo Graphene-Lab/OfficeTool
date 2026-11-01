@@ -512,6 +512,14 @@ public partial class PowerPointHandler
         };
     }
 
+    private static bool TryBox(Drawing.Transform2D? xfrm, out long x, out long y, out long w, out long h)
+    {
+        x = y = w = h = 0;
+        if (xfrm?.Offset?.X == null || xfrm.Offset.Y == null || xfrm.Extents?.Cx == null || xfrm.Extents.Cy == null) return false;
+        x = xfrm.Offset.X.Value; y = xfrm.Offset.Y.Value; w = xfrm.Extents.Cx.Value; h = xfrm.Extents.Cy.Value;
+        return true;
+    }
+
     public List<DocumentIssue> ViewAsIssues(string? issueType = null, int? limit = null)
     {
         var issues = new List<DocumentIssue>();
@@ -918,6 +926,127 @@ public partial class PowerPointHandler
             // skip it; either way it's malformed. Common cause: an earlier
             // `add row --prop cols=N` with N < grid count, now rejected at
             // write time but old files may still carry the bug.
+            // Elements with no pixel on the canvas (issue #301). The off-slide
+            // check above covers TEXT shapes; a picture, graphic frame,
+            // connector or group placed entirely outside the slide passed
+            // `view issues` and `validate` alike. Partial overhang is NOT
+            // reported here — bleed (a background or decorative image pulled
+            // past the edge) is a design idiom — only a box that intersects
+            // the slide nowhere, which PowerPoint does not show at all.
+            {
+                int picN = 0, gfN = 0, cxN = 0, grpN = 0;
+                foreach (var el in shapeTree.ChildElements)
+                {
+                    string kind; int n; long x, y, w, h;
+                    switch (el)
+                    {
+                        case Picture pic:
+                            kind = "picture"; n = ++picN;
+                            if (!TryBox(pic.ShapeProperties?.Transform2D, out x, out y, out w, out h)) continue;
+                            break;
+                        case GraphicFrame gf:
+                            kind = gf.Descendants<Drawing.Table>().Any() ? "table"
+                                 : gf.Descendants<DocumentFormat.OpenXml.Drawing.Charts.ChartReference>().Any() ? "chart" : "graphicFrame";
+                            n = ++gfN;
+                            if (gf.Transform?.Offset?.X == null || gf.Transform.Extents?.Cx == null) continue;
+                            x = gf.Transform.Offset.X!.Value; y = gf.Transform.Offset.Y!.Value;
+                            w = gf.Transform.Extents.Cx!.Value; h = gf.Transform.Extents.Cy!.Value;
+                            break;
+                        case ConnectionShape cx:
+                            kind = "connector"; n = ++cxN;
+                            if (!TryBox(cx.ShapeProperties?.Transform2D, out x, out y, out w, out h)) continue;
+                            break;
+                        case GroupShape grp:
+                            kind = "group"; n = ++grpN;
+                            var tg = grp.GroupShapeProperties?.TransformGroup;
+                            if (tg?.Offset?.X == null || tg.Extents?.Cx == null) continue;
+                            x = tg.Offset.X!.Value; y = tg.Offset.Y!.Value; w = tg.Extents.Cx!.Value; h = tg.Extents.Cy!.Value;
+                            break;
+                        default: continue;
+                    }
+                    if (w <= 0 || h <= 0) continue;
+                    bool fullyOutside = x >= slideW || y >= slideH || x + w <= 0 || y + h <= 0;
+                    if (!fullyOutside) continue;
+                    string edge = x >= slideW ? "right" : x + w <= 0 ? "left" : y >= slideH ? "bottom" : "top";
+                    var elName = el.Descendants<NonVisualDrawingProperties>().FirstOrDefault()?.Name?.Value;
+                    issues.Add(new DocumentIssue
+                    {
+                        Id = $"O{++issueNum}",
+                        Type = IssueType.Format,
+                        Severity = IssueSeverity.Warning,
+                        Path = $"/slide[{slideNum}]/{BuildElementPathSegment(kind, el, n)}",
+                        Message = $"{char.ToUpperInvariant(kind[0])}{kind[1..]}{(elName != null ? $" \"{elName}\"" : "")} lies entirely outside the slide ({edge} edge) and is not visible",
+                        Suggestion = $"Move it onto the slide (0–{slideW / 360000.0:F1}cm × 0–{slideH / 360000.0:F1}cm) or remove it."
+                    });
+                }
+            }
+
+            // A picture whose box does not keep its source's aspect ratio is
+            // being stretched (issue #301). The crop (<a:srcRect>) and the
+            // stretch inset (<a:fillRect>) are folded in first, so a crop that
+            // restores the box ratio stays silent; pictures covering the whole
+            // slide are skipped (a texture pulled over a background is meant
+            // to stretch); 5% is about where the eye starts to notice.
+            {
+                int picN = 0;
+                foreach (var pic in shapeTree.Elements<Picture>())
+                {
+                    picN++;
+                    if (!TryBox(pic.ShapeProperties?.Transform2D, out var bx, out var by, out var bw, out var bh) || bw <= 0 || bh <= 0) continue;
+                    if ((double)bw * bh >= 0.9 * (double)slideW * slideH) continue;
+                    var embed = pic.BlipFill?.Blip?.Embed?.Value;
+                    if (embed == null) continue;
+                    (int Width, int Height)? dims = null;
+                    try
+                    {
+                        if (slidePart.GetPartById(embed) is ImagePart imgPart)
+                        {
+                            // The package stream may not seek; the header
+                            // reader needs a seekable stream and only the
+                            // first bytes (PNG/BMP/GIF headers, JPEG SOF scan).
+                            using var st = imgPart.GetStream(FileMode.Open, FileAccess.Read);
+                            using var head = new MemoryStream();
+                            var buf = new byte[64 * 1024];
+                            int n = st.Read(buf, 0, buf.Length);
+                            head.Write(buf, 0, n); head.Position = 0;
+                            dims = ImageSource.TryGetDimensions(head);
+                        }
+                    }
+                    catch { }
+                    if (dims is not { Width: > 0, Height: > 0 } d) continue;
+                    double srcW = d.Width, srcH = d.Height;
+                    var src = pic.BlipFill?.SourceRectangle;
+                    if (src != null)
+                    {
+                        srcW *= 1 - ((src.Left?.Value ?? 0) + (src.Right?.Value ?? 0)) / 100000.0;
+                        srcH *= 1 - ((src.Top?.Value ?? 0) + (src.Bottom?.Value ?? 0)) / 100000.0;
+                    }
+                    double boxW = bw, boxH = bh;
+                    var fill = pic.BlipFill?.GetFirstChild<Drawing.Stretch>()?.FillRectangle;
+                    if (fill != null)
+                    {
+                        boxW *= 1 - ((fill.Left?.Value ?? 0) + (fill.Right?.Value ?? 0)) / 100000.0;
+                        boxH *= 1 - ((fill.Top?.Value ?? 0) + (fill.Bottom?.Value ?? 0)) / 100000.0;
+                    }
+                    if (srcW <= 0 || srcH <= 0 || boxW <= 0 || boxH <= 0) continue;
+                    double srcRatio = srcW / srcH, boxRatio = boxW / boxH;
+                    double off = Math.Abs(boxRatio / srcRatio - 1);
+                    if (off <= 0.05) continue;
+                    double fixH = bw / srcRatio, fixW = bh * srcRatio;
+                    var picName = pic.NonVisualPictureProperties?.NonVisualDrawingProperties?.Name?.Value;
+                    issues.Add(new DocumentIssue
+                    {
+                        Id = $"P{++issueNum}",
+                        Type = IssueType.Format,
+                        Subtype = Core.IssueSubtypes.PictureAspectDistorted,
+                        Severity = IssueSeverity.Warning,
+                        Path = $"/slide[{slideNum}]/{BuildElementPathSegment("picture", pic, picN)}",
+                        Message = $"Picture{(picName != null ? $" \"{picName}\"" : "")} is stretched: source {d.Width}x{d.Height}px ({srcRatio:0.00}:1) in a {bw / 360000.0:0.0}x{bh / 360000.0:0.0}cm box ({boxRatio:0.00}:1), {off * 100:0}% off. suggest.height={fixH / 360000.0:0.0}cm",
+                        Suggestion = $"Keep the width and set height={fixH / 360000.0:0.0}cm, or keep the height and set width={fixW / 360000.0:0.0}cm, or crop the source to the box ratio."
+                    });
+                }
+            }
+
             int tableIdx = 0;
             foreach (var graphicFrame in shapeTree.Descendants<GraphicFrame>())
             {

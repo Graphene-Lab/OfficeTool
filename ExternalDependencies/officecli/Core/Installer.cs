@@ -48,6 +48,7 @@ internal static class Installer
         ("claude", ".claude",                          ["claude", "claude-code"]),
         ("cursor", ".cursor",                          ["cursor"]),
         ("vscode", ".vscode",                          []),   // no skill equivalent
+        ("opencode", ".config/opencode",               ["opencode"]),
         ("lms",    ".cache/lm-studio",                 []),   // no skill equivalent
     ];
 

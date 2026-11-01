@@ -187,7 +187,7 @@ public partial class PowerPointHandler
         {
             var cPh = candidate.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
                 ?.GetFirstChild<PlaceholderShape>();
-            if (cPh == null || !PlaceholderMatches(ph, cPh)) continue;
+            if (cPh == null || !SlideComposition.PlaceholderMatches(ph, cPh)) continue;
 
             var typeAttr = cPh.Type?.HasValue == true ? cPh.Type.InnerText : null;
             var idxAttr = cPh.Index?.HasValue == true ? cPh.Index.Value.ToString() : null;

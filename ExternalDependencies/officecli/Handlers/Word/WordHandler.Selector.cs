@@ -135,7 +135,16 @@ public partial class WordHandler
             // Check paragraph-level attributes
             if (selector.Element != null && selector.Element != "p" && selector.Element != "paragraph")
                 return false;
-            return MatchesParagraphAttrs(para, selector.Attributes);
+            // This is the PARENT gate of a `>` combinator: the nodes the query
+            // returns are the child runs, so the CLI post-filter resolves the
+            // predicates against the runs, never against this paragraph
+            // (CONSISTENCY(query-combinator-parent-gate): see
+            // AttributeFilter.PostFilterSelector). `text` / `type` are the two
+            // keys MatchesParagraphAttrs otherwise leaves to that post-filter, so
+            // here they must resolve against the paragraph itself — otherwise the
+            // gate silently becomes match-all and `paragraph[text=AAABBB] > run`
+            // answers with both runs.
+            return MatchesParagraphAttrs(para, selector.Attributes, resolveNodeMetadata: true);
         }
 
         if (selector.Element != null && selector.Element != "p" && selector.Element != "paragraph")
@@ -157,7 +166,8 @@ public partial class WordHandler
         return true;
     }
 
-    private bool MatchesParagraphAttrs(Paragraph para, Dictionary<string, string> attrs)
+    private bool MatchesParagraphAttrs(Paragraph para, Dictionary<string, string> attrs,
+        bool resolveNodeMetadata = false)
     {
         // Cache first text-bearing run for run-level property checks
         Run? firstRun = null;
@@ -176,7 +186,25 @@ public partial class WordHandler
             // not parsed by the Word selector regex so AttributeFilter handles it.
             if (key.Equals("text", StringComparison.OrdinalIgnoreCase) ||
                 key.Equals("type", StringComparison.OrdinalIgnoreCase))
+            {
+                // ...except when this call IS that post-filter's replacement: for a
+                // `>` combinator's parent gate (resolveNodeMetadata) the post-filter
+                // is child-scoped, so nothing else applies these two keys to the
+                // paragraph. Resolve them the way ParagraphToNode populates them
+                // (Type = "paragraph", Text = GetParagraphText), so the gate keeps
+                // the meaning the post-filter used to give it.
+                if (!resolveNodeMetadata) continue;
+                bool metaNegate = rawVal.StartsWith("!");
+                var metaVal = metaNegate ? rawVal[1..] : rawVal;
+                bool metaMatches = key.Equals("type", StringComparison.OrdinalIgnoreCase)
+                    // CONSISTENCY(selector-case): `p` and `paragraph` both reach this
+                    // gate as the parent element, so accept either spelling.
+                    ? string.Equals(metaVal, "paragraph", StringComparison.OrdinalIgnoreCase)
+                      || string.Equals(metaVal, "p", StringComparison.OrdinalIgnoreCase)
+                    : string.Equals(GetParagraphText(para), metaVal, StringComparison.OrdinalIgnoreCase);
+                if (metaNegate ? metaMatches : !metaMatches) return false;
                 continue;
+            }
             bool negate = rawVal.StartsWith("!");
             var val = negate ? rawVal[1..] : rawVal;
 

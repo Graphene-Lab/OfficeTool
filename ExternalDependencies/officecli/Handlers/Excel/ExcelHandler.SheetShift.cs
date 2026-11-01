@@ -32,6 +32,7 @@
 using DocumentFormat.OpenXml;
 using DocumentFormat.OpenXml.Packaging;
 using DocumentFormat.OpenXml.Spreadsheet;
+using System.Xml.Linq;
 using Xdr = DocumentFormat.OpenXml.Drawing.Spreadsheet;
 using C = DocumentFormat.OpenXml.Drawing.Charts;
 using CX = DocumentFormat.OpenXml.Office2016.Drawing.ChartDrawing;
@@ -60,6 +61,9 @@ public partial class ExcelHandler
     /// CellFormula.Text and DefinedName text). Pass null to skip formula
     /// and named-range rewriting (rare — only ops that don't touch
     /// formula content).</param>
+    /// <param name="preserveFreezeCounts">True for a renumber (sort / move),
+    /// which permutes lines without adding or removing any, so the frozen
+    /// pane's row/column counts stay as they are.</param>
     private void ApplySheetRangeMutations(
         WorksheetPart worksheet,
         string sheetName,
@@ -67,7 +71,8 @@ public partial class ExcelHandler
         Func<string, string>? formulaTextMapper,
         Func<int, int>? rowMarkerShift = null,
         Func<int, int>? colMarkerShift = null,
-        Func<string, string, string>? crossSheetFormulaMapper = null)
+        Func<string, string, string>? crossSheetFormulaMapper = null,
+        bool preserveFreezeCounts = false)
     {
         var ws = GetSheet(worksheet);
 
@@ -314,19 +319,24 @@ public partial class ExcelHandler
         var cmtList = commentsPart?.Comments?.GetFirstChild<CommentList>();
         if (cmtList != null)
         {
-            bool cmtDirty = false;
+            var commentMoves = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
             foreach (var cmt in cmtList.Elements<Comment>().ToList())
             {
                 if (cmt.Reference?.Value == null) continue;
-                var shifted = refMapper(cmt.Reference.Value);
-                if (shifted == null) { cmt.Remove(); cmtDirty = true; }
-                else if (!string.Equals(shifted, cmt.Reference.Value, StringComparison.Ordinal))
+                var oldRef = cmt.Reference.Value;
+                var shifted = refMapper(oldRef);
+                if (!string.Equals(shifted, oldRef, StringComparison.Ordinal))
                 {
-                    cmt.Reference = shifted;
-                    cmtDirty = true;
+                    commentMoves[oldRef] = shifted;
+                    if (shifted == null) cmt.Remove();
+                    else cmt.Reference = shifted;
                 }
             }
-            if (cmtDirty) commentsPart!.Comments!.Save();
+            if (commentMoves.Count > 0)
+            {
+                ApplyCommentVmlMutations(worksheet, commentMoves);
+                commentsPart!.Comments!.Save();
+            }
         }
 
         // 6e. sparklines (x14 extension list on the worksheet). Each sparkline
@@ -387,6 +397,34 @@ public partial class ExcelHandler
                     var newTlc = refMapper(tlc);
                     if (newTlc != null && !string.Equals(newTlc, tlc, StringComparison.Ordinal))
                         pane.TopLeftCell = newTlc;
+                }
+                // The freeze boundary is xSplit/ySplit ALONE (the frozen row /
+                // column COUNTS). topLeftCell is only the scrolled pane's scroll
+                // position, which Excel rewrites on every save made while
+                // scrolled, so the splits must never be derived from it: they
+                // used to be, and on any scrolled sheet a single insert above
+                // the scroll position turned a one-row freeze into a freeze of
+                // hundreds of rows (#454).
+                //
+                // Shift the counts with the axis' 0-based line shift instead:
+                //   newCount = min(shift(count), shift(count - 1) + 1)
+                // which grows the band when a line is inserted inside it,
+                // shrinks it when a frozen line is deleted, and leaves it alone
+                // for an insert at / below the boundary or a delete below it.
+                // A renumber (sort / row move) only permutes lines, so it keeps
+                // the counts as they are.
+                if (!preserveFreezeCounts && pane != null && pane.State?.Value == PaneStateValues.Frozen)
+                {
+                    static int ShiftCount(int count, Func<int, int>? shift)
+                    {
+                        if (count <= 0 || shift == null) return count;
+                        return Math.Max(0, Math.Min(shift(count), shift(count - 1) + 1));
+                    }
+                    int xs = (int)(pane.HorizontalSplit?.Value ?? 0);
+                    int ys = (int)(pane.VerticalSplit?.Value ?? 0);
+                    int nxs = ShiftCount(xs, colMarkerShift), nys = ShiftCount(ys, rowMarkerShift);
+                    if (nxs != xs) pane.HorizontalSplit = nxs > 0 ? nxs : null;
+                    if (nys != ys) pane.VerticalSplit = nys > 0 ? nys : null;
                 }
                 foreach (var sel in sv.Elements<Selection>())
                 {
@@ -535,7 +573,7 @@ public partial class ExcelHandler
                             cell.CellFormula.Text = newText;
                             InvalidateCacheIfShiftBrokeFormula(cell, oldText, newText);
                         }
-                otherPart.Worksheet.Save();
+                GetSheet(otherPart).Save();
             }
         }
 
@@ -561,6 +599,79 @@ public partial class ExcelHandler
                 }
                 if (changed) GetWorkbook().Save();
             }
+        }
+    }
+
+    // A legacy comment's text ref and its VML Note target describe the same
+    // cell. Match shapes against ORIGINAL refs in one pass: looking up each
+    // old ref after rewriting the previous shape can shift adjacent notes twice.
+    //
+    // The popup box's 8-number Anchor (LeftCol, LeftOff, TopRow, TopOff,
+    // RightCol, RightOff, BottomRow, BottomOff) is translated by the same
+    // row/col delta as the cell — that is what Excel itself does when a
+    // note's cell is displaced, so the box keeps its size and its position
+    // relative to the cell instead of being left hovering over the old row.
+    // Offsets and unrelated controls (OLE, form buttons) are untouched.
+    private static void ApplyCommentVmlMutations(
+        WorksheetPart worksheet, IReadOnlyDictionary<string, string?> commentMoves)
+    {
+        XNamespace v = "urn:schemas-microsoft-com:vml";
+        XNamespace x = "urn:schemas-microsoft-com:office:excel";
+        // Follow this worksheet's relationships, not a guessed part name or
+        // the first VML part (which may belong to header/footer controls).
+        foreach (var vmlPart in worksheet.VmlDrawingParts)
+        {
+            XDocument doc;
+            try
+            {
+                using var stream = vmlPart.GetStream(FileMode.Open, FileAccess.Read);
+                doc = XDocument.Load(stream, LoadOptions.PreserveWhitespace);
+            }
+            catch (System.Xml.XmlException)
+            {
+                // Externally-authored VML that is not well-formed XML: the
+                // comment refs have still been shifted; leave this part as-is
+                // rather than fail the whole row/column operation (same
+                // tolerance as RemoveCommentVmlShapeByRef).
+                continue;
+            }
+            bool dirty = false;
+            foreach (var shape in doc.Descendants(v + "shape").ToList())
+            {
+                var data = shape.Element(x + "ClientData");
+                if (data == null || (string?)data.Attribute("ObjectType") != "Note") continue;
+                var row = data.Element(x + "Row");
+                var col = data.Element(x + "Column");
+                if (row == null || col == null
+                    || !int.TryParse(row.Value, out var r) || r < 0 || r >= ExcelMaxRow
+                    || !int.TryParse(col.Value, out var c) || c < 0 || c >= ExcelMaxCol)
+                    continue;
+                var oldRef = $"{IndexToColumnName(c + 1)}{r + 1}";
+                if (!commentMoves.TryGetValue(oldRef, out var shifted)) continue;
+                dirty = true;
+                if (shifted == null) { shape.Remove(); continue; }
+
+                var (colName, rowNum) = ParseCellReference(shifted);
+                int newR = rowNum - 1, newC = ColumnNameToIndex(colName) - 1;
+                row.Value = newR.ToString();
+                col.Value = newC.ToString();
+
+                var anchor = data.Element(x + "Anchor");
+                if (anchor == null) continue;
+                var parts = anchor.Value.Split(',');
+                if (parts.Length != 8) continue;
+                var nums = new int[8];
+                bool parsed = true;
+                for (int i = 0; i < 8 && parsed; i++) parsed = int.TryParse(parts[i].Trim(), out nums[i]);
+                if (!parsed) continue;
+                int dRow = newR - r, dCol = newC - c;
+                nums[0] = Math.Max(0, nums[0] + dCol); nums[4] = Math.Max(0, nums[4] + dCol);
+                nums[2] = Math.Max(0, nums[2] + dRow); nums[6] = Math.Max(0, nums[6] + dRow);
+                anchor.Value = string.Join(", ", nums);
+            }
+            if (!dirty) continue;
+            using var output = vmlPart.GetStream(FileMode.Create, FileAccess.Write);
+            doc.Save(output, SaveOptions.DisableFormatting);
         }
     }
 

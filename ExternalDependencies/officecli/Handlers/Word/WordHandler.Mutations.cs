@@ -16,8 +16,10 @@ namespace OfficeCli.Handlers;
 public partial class WordHandler
 {
     public string? Remove(string path, Dictionary<string, string>? properties = null)
+        => MarkModified(() => RemoveCore(path, properties));
+
+    private string? RemoveCore(string path, Dictionary<string, string>? properties)
     {
-        Modified = true;
         using var _bodyCacheGuard = new BodyCacheGuard(this); // invalidate caches on return (AFTER the mutation)
 
         // Phase 4: remove + trackChange.* → produce w:del wrapper(s) instead
@@ -550,7 +552,7 @@ public partial class WordHandler
                     {
                         var orphan = commentsRoot.Elements<Comment>()
                             .FirstOrDefault(c => c.Id?.Value == cid);
-                        orphan?.Remove();
+                        if (orphan != null) { RemoveCommentSidecars(orphan); orphan.Remove(); }
                     }
                 }
                 commentsRoot.Save();
@@ -560,6 +562,7 @@ public partial class WordHandler
         // If removing a Comment, also clean up dangling references in the body
         if (element is Comment comment && comment.Id?.Value is string commentId)
         {
+            RemoveCommentSidecars(comment);
             var body2 = _doc.MainDocumentPart?.Document?.Body;
             if (body2 != null)
             {
@@ -953,8 +956,13 @@ public partial class WordHandler
 
             // ¶ mark del — pPr/rPr/<w:del/>
             var pPr = paraEl.ParagraphProperties ?? paraEl.PrependChild(new ParagraphProperties());
-            var pPrRpr = pPr.ParagraphMarkRunProperties
-                       ?? pPr.AppendChild(new ParagraphMarkRunProperties());
+            var pPrRpr = pPr.ParagraphMarkRunProperties;
+            if (pPrRpr == null)
+            {
+                // CT_PPr keeps rPr before sectPr/pPrChange — place, don't append.
+                pPrRpr = pPr.AppendChild(new ParagraphMarkRunProperties());
+                OfficeCli.Core.SchemaOrder.Place(pPr, pPrRpr);
+            }
             // Schema: paragraph-mark deletion marker is a bare <w:del>
             // (no inner properties), child of w:rPr inside w:pPr.
             var paraDel = new Deleted
@@ -963,7 +971,13 @@ public partial class WordHandler
                 Date = tcDate,
                 Id = !string.IsNullOrEmpty(tcExplicitId) ? tcExplicitId : GenerateRevisionId(),
             };
+            // CT_ParaRPr puts ins/del/moveFrom/moveTo FIRST, before rStyle/
+            // rFonts/…; appending after the mark's existing formatting wrote a
+            // schema-invalid rPr whenever the ¶ mark already carried run
+            // properties (most Word-authored paragraphs). The resident path
+            // only came out right because a later save pass reordered it (#450).
             pPrRpr.AppendChild(paraDel);
+            OfficeCli.Core.SchemaOrder.Place(pPrRpr, paraDel);
 
             // Wrap every existing Run child in its own w:del with w:t → w:delText.
             // Each run wrapper gets its own unique id (still distinct from the
@@ -1208,6 +1222,9 @@ public partial class WordHandler
     }
 
     public string Move(string sourcePath, string? targetParentPath, InsertPosition? position, Dictionary<string, string>? properties = null)
+        => MarkModified(() => MoveCore(sourcePath, targetParentPath, position, properties));
+
+    private string MoveCore(string sourcePath, string? targetParentPath, InsertPosition? position, Dictionary<string, string>? properties)
     {
         using var _bodyCacheGuard = new BodyCacheGuard(this); // invalidate caches on return (AFTER the mutation)
         // Detect track-change branch: any trackChange.author/date/id signals
@@ -1620,6 +1637,9 @@ public partial class WordHandler
     }
 
     public (string NewPath1, string NewPath2) Swap(string path1, string path2)
+        => MarkModified(() => SwapCore(path1, path2));
+
+    private (string NewPath1, string NewPath2) SwapCore(string path1, string path2)
     {
         using var _bodyCacheGuard = new BodyCacheGuard(this); // invalidate caches on return (AFTER the mutation)
         var parts1 = ParsePath(path1);
@@ -1690,6 +1710,9 @@ public partial class WordHandler
     }
 
     public string CopyFrom(string sourcePath, string targetParentPath, InsertPosition? position)
+        => MarkModified(() => CopyFromCore(sourcePath, targetParentPath, position));
+
+    private string CopyFromCore(string sourcePath, string targetParentPath, InsertPosition? position)
     {
         using var _bodyCacheGuard = new BodyCacheGuard(this); // invalidate caches on return (AFTER the mutation)
         // Virtual table column clone — same-table only.
@@ -2013,7 +2036,27 @@ public partial class WordHandler
         // anchor-based positions and always appended.
         var index = ResolveAnchorPosition(targetParent, targetParentPath, position);
 
-        InsertAtPosition(targetParent, clone, index);
+        // CONSISTENCY(table-row-anchor): for a row anchor inside a <w:tbl>,
+        // ResolveAnchorPosition returns a ROW-ONLY index (the AddRow contract),
+        // not an offset into ChildElements. InsertAtPosition indexes
+        // ChildElements, where tblPr / tblGrid precede the rows, so the clone
+        // landed two rows early (`--from tr[4] --after tr[4]` produced tr[3])
+        // and the reported path matched the wrong spot, with no error. Insert a
+        // cloned row in row space instead.
+        if (targetParent is Table rowTable && clone is TableRow && index.HasValue)
+        {
+            var rows = rowTable.Elements<TableRow>().ToList();
+            if (index.Value >= 0 && index.Value < rows.Count)
+                rows[index.Value].InsertBeforeSelf(clone);
+            else if (rows.Count > 0)
+                rows[^1].InsertAfterSelf(clone);
+            else
+                AppendToParent(rowTable, clone);
+        }
+        else
+        {
+            InsertAtPosition(targetParent, clone, index);
+        }
 
         SaveDoc();
 

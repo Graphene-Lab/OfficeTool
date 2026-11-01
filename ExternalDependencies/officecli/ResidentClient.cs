@@ -36,12 +36,51 @@ public static class ResidentClient
             if (string.IsNullOrEmpty(response.Stdout)) return false;
             var residentFilePath = Path.GetFullPath(response.Stdout);
             var requestedFilePath = Path.GetFullPath(filePath);
-            return string.Equals(residentFilePath, requestedFilePath, StringComparison.OrdinalIgnoreCase);
+            if (!string.Equals(residentFilePath, requestedFilePath, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            // A resident left over from a previous binary (the ping ack carries
+            // its version) is retired: after an in-place auto-update its
+            // single-file bundle has been replaced on disk, so any assembly it
+            // still has to load can fail with FileNotFound (issue #489). Ask it
+            // to flush and exit, then report "no resident" so the caller starts
+            // a fresh one from the current binary. Residents older than the
+            // version-bearing ack answer with an empty version and are kept.
+            var mine = Core.UpdateChecker.GetCurrentVersionPublic();
+            var theirs = response.Stderr;
+            if (!string.IsNullOrEmpty(theirs) && !string.IsNullOrEmpty(mine)
+                && !string.Equals(theirs, mine, StringComparison.Ordinal))
+            {
+                RetireStaleResident(filePath, theirs, mine);
+                return false;
+            }
+            return true;
         }
         catch
         {
             return false;
         }
+    }
+
+    // One retirement per file per process: TryConnect runs several times
+    // inside a single command, and the old resident needs a moment to exit.
+    private static readonly HashSet<string> s_retired = new(StringComparer.OrdinalIgnoreCase);
+
+    private static void RetireStaleResident(string filePath, string theirs, string mine)
+    {
+        var key = Path.GetFullPath(filePath);
+        lock (s_retired)
+        {
+            if (!s_retired.Add(key)) return;
+        }
+        try
+        {
+            // Same ping-pipe close the `close` command uses; the ack arrives
+            // after the resident has flushed and released the file.
+            SendCloseWithResponse(filePath, out _);
+            Console.Error.WriteLine($"officecli: resident for {Path.GetFileName(filePath)} was running {theirs}; closed it, the {mine} binary will start a fresh one.");
+        }
+        catch { /* best effort — the caller falls back to direct mode */ }
     }
 
     /// <summary>

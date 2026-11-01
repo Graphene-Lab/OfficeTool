@@ -18,8 +18,15 @@ namespace OfficeCli;
 /// </summary>
 public static class McpServer
 {
+    /// <summary>
+    /// True once this process serves the MCP stdio protocol; stdin is then the
+    /// JSON-RPC channel, not a payload source (see CommandBuilder.ReadStdInPayload).
+    /// </summary>
+    internal static volatile bool InMcpMode;
+
     public static async Task RunAsync()
     {
+        InMcpMode = true;
         using var reader = new StreamReader(Console.OpenStandardInput());
         using var writer = new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true };
 
@@ -482,7 +489,15 @@ public static class McpServer
                      : stdout.Length > 0 ? stdout : stderr;
         // exit 2 with stdout = "applied with caveats" (element added, only an
         // unsupported property dropped) — the op landed, so it is NOT an error.
-        bool appliedWithCaveats = r.Exit == 2 && stdout.Length > 0;
+        // Exit 2 covers two verdicts: "applied with caveats" (envelope
+        // success:true, e.g. one unsupported prop dropped) AND "nothing
+        // applied" (success:false, every prop refused). Reading the exit code
+        // alone reported the second as not-an-error, so an agent whose edit
+        // never landed was told it had. The envelope is the business verdict —
+        // when stdout carries one, it decides; text mode falls back to the
+        // "Error:" prefix the CLI puts on a refused command.
+        bool appliedWithCaveats = r.Exit == 2 && stdout.Length > 0
+            && (EnvelopeSuccess(stdout) ?? !stdout.TrimStart().StartsWith("Error", StringComparison.OrdinalIgnoreCase));
         bool isError = r.Exit != 0 && !appliedWithCaveats;
         // Surface the CLI output VERBATIM — exit mirrors envelope.success, so a
         // non-zero *business* verdict (batch with a failed step, validate
@@ -494,6 +509,21 @@ public static class McpServer
         // reading stdout plus the exit code.
         var text = combined.Length == 0 ? (isError ? "Command failed." : "(ok)") : combined;
         return (new[] { new McpContent("text", Text: text) }, isError);
+    }
+
+    /// <summary>The envelope's top-level `success`, or null when stdout is not a JSON object.</summary>
+    private static bool? EnvelopeSuccess(string stdout)
+    {
+        var t = stdout.TrimStart();
+        if (!t.StartsWith('{')) return null;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(t);
+            return doc.RootElement.TryGetProperty("success", out var v) && v.ValueKind == System.Text.Json.JsonValueKind.False ? false
+                 : doc.RootElement.TryGetProperty("success", out v) && v.ValueKind == System.Text.Json.JsonValueKind.True ? true
+                 : null;
+        }
+        catch (System.Text.Json.JsonException) { return null; }
     }
 
     private static string FirstNonEmpty(params string[] xs) =>
@@ -548,8 +578,18 @@ Delivery gate (before reporting a document finished — any failure = fix and re
         // argv array. Everything else (verbs, flags, schemas) is discovered via
         // `help` and the loaded skills — no per-command schema to drift.
         w.WriteStartObject("command");
-        w.WriteStartArray("type"); w.WriteStringValue("string"); w.WriteStringValue("array"); w.WriteEndArray();
+        // A union `type: ["string","array"]` with a sibling `items` is valid
+        // JSON Schema, but the Gemini function-calling schema takes a single
+        // type and rejects `items` unless that type is ARRAY — every request
+        // through a Gemini-backed client failed with HTTP 400 before the model
+        // saw a prompt. `anyOf` with one branch per shape is accepted by every
+        // client that took the union, and by Gemini.
+        w.WriteStartArray("anyOf");
+        w.WriteStartObject(); w.WriteString("type", "string"); w.WriteEndObject();
+        w.WriteStartObject(); w.WriteString("type", "array");
         w.WriteStartObject("items"); w.WriteString("type", "string"); w.WriteEndObject();
+        w.WriteEndObject();
+        w.WriteEndArray();
         w.WriteString("description",
             "The officecli command line — either a single string (e.g. \"add deck.pptx /slide[1] --type shape --prop text=Hi\") "
             + "or a pre-split argv array of strings (use the array form when an argument contains spaces or quotes). A leading "

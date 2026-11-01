@@ -907,6 +907,9 @@ public partial class PowerPointHandler
             Text = text,
             Preview = string.IsNullOrEmpty(text) ? name : (text.Length > 50 ? text[..50] + "..." : text)
         };
+        // <p:cNvPr hidden="1"> — the renderers skip it (SlideComposition.IsHidden);
+        // surface the same bit here so a reader knows why it is absent from the preview.
+        if (SlideComposition.IsHidden(shape)) node.Format["hidden"] = true;
 
         node.Format["name"] = name;
         if (phTypeStr != null) node.Format["phType"] = phTypeStr;
@@ -1019,6 +1022,17 @@ public partial class PowerPointHandler
                 if (xfrm.Extents.Cy is not null) node.Format["height"] = FormatEmu(xfrm.Extents.Cy!);
             }
         }
+
+        // SlideComposition (issue #466): a placeholder shape with no own xfrm —
+        // a title with an empty spPr, for example — inherits its whole frame
+        // from the layout/master slot (xfrm is atomic; see the module header).
+        // Report the EFFECTIVE frame with provenance, mirroring the
+        // effective.*.src convention StyleList already uses for inherited text
+        // properties. Bare x/y stay OWN-only: their absence is what tells the
+        // reader the shape does not own its position.
+        if (phElemForNode != null && part is SlidePart shapeSlotPart
+            && !SlideComposition.HasCompleteOwnFrame(xfrm))
+            EmitInheritedFrame(node, phElemForNode, shapeSlotPart, slideNum);
 
         // Shape fill
         var shapeFill = shape.ShapeProperties?.GetFirstChild<Drawing.SolidFill>();
@@ -2519,10 +2533,20 @@ public partial class PowerPointHandler
     // `add textbox normalizeH=true` and a multi-run shape silently broadcast
     // the first run's flag to every subsequent run on dump→replay. Filter
     // it here so it stays on the run where it lives.
+    // R87: kern (rPr/@kern, the minimum size at which pair kerning applies) is
+    // the same shape of attribute. The lift surfaced the FIRST run's value, and
+    // because dump splits a textbox's text into a later `set paragraph text=`
+    // item, the replayed `add textbox kern=…` met a runless shape and Add
+    // materialised it as a paragraph default (`<a:pPr><a:defRPr kern=…/>`)
+    // instead of on the run. In a mixed-kern paragraph (run1 1200, run2 unset)
+    // every sibling run then inherited a kern the source never gave it — a
+    // rendering change, not just a dump wobble — and in a uniform or single-run
+    // paragraph the replay stopped being a fixed point. Filter it here so it
+    // stays on the run that owns it.
     private static readonly System.Collections.Generic.HashSet<string> RunOnlyAttrs =
         new(System.StringComparer.Ordinal)
     {
-        "err", "dirty", "smtClean", "lang", "normalizeH",
+        "err", "dirty", "smtClean", "lang", "normalizeH", "kern",
     };
 
     private static void FillUnknownRunProps(Drawing.RunProperties? rPr, DocumentNode node, bool shapeLevel = false)
@@ -2595,6 +2619,9 @@ public partial class PowerPointHandler
             Type = mediaType,
             Preview = name
         };
+        // <p:cNvPr hidden="1"> — the renderers skip it (SlideComposition.IsHidden);
+        // surface the same bit here so a reader knows why it is absent from the preview.
+        if (SlideComposition.IsHidden(pic)) node.Format["hidden"] = true;
 
         node.Format["name"] = name;
         var picId = GetCNvPrId(pic);
@@ -2711,6 +2738,35 @@ public partial class PowerPointHandler
         // Flip — CONSISTENCY(shape-picture-parity): mirror ShapeToNode.
         if (picXfrm?.HorizontalFlip?.Value == true) node.Format["flipH"] = true;
         if (picXfrm?.VerticalFlip?.Value == true) node.Format["flipV"] = true;
+
+        // CONSISTENCY(picture-placeholder-identity): a picture filled into a
+        // picture placeholder carries <p:ph> exactly like a placeholder shape
+        // does. ShapeToNode surfaces phType/phIndex/phBare; without this, a
+        // slot-bound picture looked like a plain picture and the slot binding
+        // was invisible to get — the picture "had no position" instead of
+        // "inherited its position from slot idx=1".
+        var picPhElem = pic.NonVisualPictureProperties?.ApplicationNonVisualDrawingProperties
+            ?.GetFirstChild<PlaceholderShape>();
+        if (picPhElem != null)
+        {
+            var picPhTypeStr = FormatPlaceholderType(picPhElem.Type?.Value);
+            if (picPhTypeStr != null) node.Format["phType"] = picPhTypeStr;
+            if (picPhElem.Index?.Value is uint picPhIdx) node.Format["phIndex"] = picPhIdx;
+            // Same round-trip marker as ShapeToNode: a truly BARE <p:ph/>
+            // (no type, no idx) must not silently become type=body on replay.
+            if (picPhElem.Type?.Value == null && picPhElem.Index?.Value == null)
+                node.Format["phBare"] = "true";
+        }
+
+        // SlideComposition (issue #466): a slot-bound picture owns NO xfrm —
+        // its frame belongs to the layout/master placeholder. Report the
+        // EFFECTIVE frame with provenance, same effective.*.src convention as
+        // the ShapeToNode path above and StyleList's inherited text values.
+        // Bare x/y stay OWN-only: their absence is what tells the reader the
+        // picture does not own its position.
+        if (picPhElem != null && slidePart != null
+            && !SlideComposition.HasCompleteOwnFrame(picXfrm))
+            EmitInheritedFrame(node, picPhElem, slidePart, slideNum);
 
         // CONSISTENCY(picture-geometry): a picture can be "cropped to shape" via a
         // non-rectangle <a:prstGeom> on its spPr (e.g. prst="ellipse"). AddPicture
@@ -3144,6 +3200,9 @@ public partial class PowerPointHandler
             Type = "connector",
             Preview = name
         };
+        // <p:cNvPr hidden="1"> — the renderers skip it (SlideComposition.IsHidden);
+        // surface the same bit here so a reader knows why it is absent from the preview.
+        if (SlideComposition.IsHidden(cxn)) node.Format["hidden"] = true;
         node.Format["name"] = name;
         var cxnId = GetCNvPrId(cxn);
         if (cxnId.HasValue) node.Format["id"] = cxnId.Value;
@@ -3613,5 +3672,24 @@ public partial class PowerPointHandler
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Report the frame a slot-bound shape or picture inherits from its
+    /// layout/master placeholder as <c>effective.x/y/width/height</c> with the
+    /// slot as <c>effective.*.src</c>. Bare x/y stay own-only: their absence
+    /// is what tells the reader the element does not own its position.
+    /// </summary>
+    private static void EmitInheritedFrame(DocumentNode node, PlaceholderShape ph, SlidePart slidePart, int slideNum)
+    {
+        var frame = SlideComposition.ResolveInheritedFrame(ph, slidePart);
+        if (frame == null) return;
+        var src = SlideComposition.ProvenancePath(slideNum, frame);
+        node.Format["effective.x"] = FormatEmu(frame.X);
+        node.Format["effective.y"] = FormatEmu(frame.Y);
+        node.Format["effective.width"] = FormatEmu(frame.Cx);
+        node.Format["effective.height"] = FormatEmu(frame.Cy);
+        foreach (var k in new[] { "x", "y", "width", "height" })
+            node.Format[$"effective.{k}.src"] = src;
     }
 }

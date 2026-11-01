@@ -16,8 +16,10 @@ namespace OfficeCli.Handlers;
 public partial class WordHandler
 {
     public string Add(string parentPath, string type, InsertPosition? position, Dictionary<string, string> properties)
+        => MarkModified(() => AddCore(parentPath, type, position, properties));
+
+    private string AddCore(string parentPath, string type, InsertPosition? position, Dictionary<string, string> properties)
     {
-        Modified = true;
         // The signature is non-nullable, but the body uses `type?.Equals(...)`
         // below to short-circuit header/footer routing — that null-conditional
         // makes the C# flow analyzer treat `type` as nullable from that point
@@ -604,6 +606,9 @@ public partial class WordHandler
     }
 
     public (string RelId, string PartPath) AddPart(string parentPartPath, string partType, Dictionary<string, string>? properties = null)
+        => MarkModified(() => AddPartCore(parentPartPath, partType, properties));
+
+    private (string RelId, string PartPath) AddPartCore(string parentPartPath, string partType, Dictionary<string, string>? properties)
     {
         var mainPart = _doc.MainDocumentPart!;
 
@@ -1140,14 +1145,15 @@ public partial class WordHandler
         }
         if (sectPr.GetFirstChild<PageSize>() == null)
         {
-            var pgSz = new PageSize { Width = WordPageDefaults.A4WidthTwips, Height = WordPageDefaults.A4HeightTwips };
-            // Schema order: pgSz must come before pgMar, cols, and docGrid
-            var firstNonRef = sectPr.ChildElements.FirstOrDefault(c =>
-                c is not HeaderReference && c is not FooterReference && c is not SectionType);
-            if (firstNonRef != null)
-                firstNonRef.InsertBeforeSelf(pgSz);
-            else
-                sectPr.AppendChild(pgSz);
+            // Place by CT_SectPr rank. headerReference/footerReference/SectionType
+            // are not the only children that precede pgSz — footnotePr and
+            // endnotePr do too, and treating them as "first non-ref" put pgSz
+            // ahead of them, which Word's validator rejects.
+            InsertSectPrChildInOrder(sectPr, new PageSize
+            {
+                Width = WordPageDefaults.A4WidthTwips,
+                Height = WordPageDefaults.A4HeightTwips,
+            });
         }
         return sectPr;
     }
@@ -1159,12 +1165,7 @@ public partial class WordHandler
         if (margin == null)
         {
             margin = new PageMargin { Top = 1440, Bottom = 1440, Left = 1800, Right = 1800 };
-            // Insert after PageSize to maintain CT_SectPr schema order: pgSz → pgMar → ...
-            var pgSz = sectPr.GetFirstChild<PageSize>();
-            if (pgSz != null)
-                pgSz.InsertAfterSelf(margin);
-            else
-                sectPr.AddChild(margin, throwOnError: false);
+            InsertSectPrChildInOrder(sectPr, margin);
         }
         return margin;
     }

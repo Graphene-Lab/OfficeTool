@@ -269,7 +269,7 @@ public partial class PowerPointHandler
         }
         pending.forEach(function(el) {
             try {
-                katex.render(el.dataset.formula, el, { throwOnError: false, displayMode: true });
+                katex.render(el.dataset.formula, el, { throwOnError: false, displayMode: el.dataset.display === '1' });
                 el.classList.add('katex-rendered');
             } catch(e) { el.textContent = el.dataset.formula + ' (Error: ' + e.message + '. See https://katex.org/docs/supported.html for supported syntax.)'; }
         });
@@ -362,17 +362,7 @@ public partial class PowerPointHandler
         var spTree = notesPart?.NotesSlide?.CommonSlideData?.ShapeTree;
         if (spTree == null) return;
 
-        Shape? notesShape = null;
-        foreach (var shape in spTree.Elements<Shape>())
-        {
-            var ph = shape.NonVisualShapeProperties?.ApplicationNonVisualDrawingProperties
-                ?.GetFirstChild<PlaceholderShape>();
-            if (ph?.Index?.Value == 1)
-            {
-                notesShape = shape;
-                break;
-            }
-        }
+        var notesShape = FindNotesBodyShape(spTree);
         if (notesShape == null) return;
 
         var paragraphs = notesShape.TextBody?.Elements<Drawing.Paragraph>().ToList()
@@ -681,6 +671,8 @@ public partial class PowerPointHandler
         // Collect all content elements in z-order (as they appear in XML)
         foreach (var element in shapeTree.ChildElements)
         {
+            // <p:cNvPr hidden="1"> — PowerPoint does not draw the shape (issue #466).
+            if (SlideComposition.IsHidden(element)) continue;
             switch (element)
             {
                 case Shape shape:
@@ -761,21 +753,44 @@ public partial class PowerPointHandler
                 if (ph?.Index?.HasValue == true) slidePlaceholders.Add($"idx:{ph.Index.Value}");
                 if (ph?.Type?.HasValue == true) slidePlaceholders.Add($"type:{ph.Type.InnerText}");
             }
+            // A filled picture placeholder is a <p:pic>, not a <p:sp> — it
+            // occupies its layout slot just the same.
+            foreach (var pic in slideShapeTree.Elements<Picture>())
+            {
+                var ph = pic.NonVisualPictureProperties?.ApplicationNonVisualDrawingProperties
+                    ?.GetFirstChild<PlaceholderShape>();
+                if (ph?.Index?.HasValue == true) slidePlaceholders.Add($"idx:{ph.Index.Value}");
+                if (ph?.Type?.HasValue == true) slidePlaceholders.Add($"type:{ph.Type.InnerText}");
+            }
         }
 
-        // Render shapes from SlideLayout (higher priority)
-        var layoutPart = slidePart.SlideLayoutPart;
-        if (layoutPart != null)
-            RenderInheritedShapes(sb, layoutPart.SlideLayout?.CommonSlideData?.ShapeTree, layoutPart, slidePlaceholders, themeColors, slideNum);
+        // <p:hf> gates (issue #466, symptom 2): a metadata slot the layout/master
+        // turns off is skipped by both inherited passes, same mechanism as a
+        // slot the slide supplies itself.
+        foreach (var key in SlideComposition.HiddenMetadataSlotKeys(slidePart))
+            slidePlaceholders.Add(key);
 
-        // Render shapes from SlideMaster (lower priority, only if not in layout).
-        // R12-2: <p:sld showMasterSp="0"> suppresses master-level decoration.
-        // (Layout placeholders above still render — matches PowerPoint, where
-        // the flag only governs the master's own shapes.)
-        var showMasterSp = GetSlide(slidePart).ShowMasterShapes?.Value ?? true;
+        // CONSISTENCY(layer-paint-order): the two inherited passes are emitted
+        // master first, layout second, because that emission order IS the
+        // stacking order — the slide markup carries no z-index, so a shape's
+        // position in the DOM is the only thing that decides what covers what.
+        // PowerPoint paints master (bottom) → layout → slide (top); the calls
+        // used to run layout-then-master, which lifted every master decoration
+        // ABOVE the layout's shapes. Covering a master decoration with an opaque
+        // layout-level shape is ordinary authoring, so the preview was showing
+        // shapes PowerPoint deliberately hides (issue #466, symptom 3).
+        var layoutPart = slidePart.SlideLayoutPart;
         var masterPart = layoutPart?.SlideMasterPart;
+
+        // R12-2: <p:sld showMasterSp="0"> suppresses master-level decoration.
+        // The flag only governs the master's own shapes — layout placeholders
+        // still render.
+        var showMasterSp = SlideComposition.ShowMasterShapes(slidePart);
         if (masterPart != null && showMasterSp)
             RenderInheritedShapes(sb, masterPart.SlideMaster?.CommonSlideData?.ShapeTree, masterPart, slidePlaceholders, themeColors, slideNum);
+
+        if (layoutPart != null)
+            RenderInheritedShapes(sb, layoutPart.SlideLayout?.CommonSlideData?.ShapeTree, layoutPart, slidePlaceholders, themeColors, slideNum);
     }
 
     // RenderInheritedShapes — render the layout/master shapes that the slide
@@ -801,6 +816,10 @@ public partial class PowerPointHandler
 
         foreach (var element in shapeTree.ChildElements)
         {
+            // CONSISTENCY(hidden-gate): a decoration marked hidden stays hidden in the
+            // composition too — <p:cNvPr hidden="1"> means the shape is not drawn,
+            // wherever it lives, so this pass must not paint it onto the slide.
+            if (SlideComposition.IsHidden(element)) continue;
             switch (element)
             {
                 case Shape shape:
@@ -830,6 +849,7 @@ public partial class PowerPointHandler
         // Also render pictures from layout/master (logos, decorative images)
         foreach (var pic in shapeTree.Elements<Picture>())
         {
+            if (SlideComposition.IsHidden(pic)) continue;
             RenderPicture(sb, pic, part, themeColors);
         }
     }

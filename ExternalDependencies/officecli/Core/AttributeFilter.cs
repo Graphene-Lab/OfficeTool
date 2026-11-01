@@ -744,7 +744,7 @@ internal static class AttributeFilter
         // past ~7.9e28, which made `[Amount>1e200]` a no-match while
         // `[Amount=1e300]` still hit via the string-equality fallback —
         // wrong answers with no warning. Non-finite parses (1e999) stay null.
-        return double.TryParse(trimmed, NumberStyles.Any, CultureInfo.InvariantCulture, out var n)
+        return NumericText.TryParse(trimmed, out var n)
             && double.IsFinite(n) ? n : null;
     }
 
@@ -912,6 +912,28 @@ internal static class AttributeFilter
             int.TryParse(m.Groups[1].Value.Trim(), out _) ? m.Value : "");
 
     /// <summary>
+    /// Index of the top-level `>` child combinator, or -1 when the selector has
+    /// none. Mirrors the handlers' own split (WordHandler.SplitChildCombinator):
+    /// a `>` inside a predicate bracket is comparison text
+    /// (`paragraph[size>=14pt] > run`), never a combinator, so only a
+    /// bracket-depth-0 `>` splits.
+    /// </summary>
+    private static int ChildCombinatorIndex(string selector)
+    {
+        int depth = 0;
+        for (int i = 0; i < selector.Length; i++)
+        {
+            switch (selector[i])
+            {
+                case '[': depth++; break;
+                case ']': depth--; break;
+                case '>' when depth == 0: return i;
+            }
+        }
+        return -1;
+    }
+
+    /// <summary>
     /// Unified selector filtering for query / set / remove. A pure-AND (flat)
     /// selector takes the exact legacy path: the handler pre-filters and the flat
     /// conditions are re-applied (idempotent). A selector containing `or` is
@@ -928,6 +950,169 @@ internal static class AttributeFilter
     /// always applies all conditions: stripping the bracket means the handler did
     /// not pre-filter, so the tree must evaluate every predicate itself.
     /// </param>
+    /// <summary>
+    /// A selector must begin with something a handler can read as an element,
+    /// a cell/sheet reference, a path or a predicate. One that opens with a
+    /// stray symbol (<c>%%%badselector</c>, <c>!!invalid!!</c>) parsed to an
+    /// EMPTY element token in xlsx and pptx, and an empty token means "no type
+    /// filter" — every cell / every shape came back with exit 0, which is a
+    /// bulk-edit hazard once the same selector reaches set/remove. docx
+    /// happened to return nothing. Reject it in one place so all three formats
+    /// answer with the same invalid_selector the bracket checks already emit.
+    /// </summary>
+    private static void RejectGarbageSelectorHead(string selector)
+    {
+        var s = selector.TrimStart();
+        if (s.Length == 0) return;
+        var c = s[0];
+        // letters/digits/_ : element names, A1 refs, sheet names
+        // ' "            : Excel-quoted sheet names ('My Data'!row)
+        // / [ :          : path form, bare predicate, pseudo-class
+        // * . # @ $ (    : wildcard / CSS-style heads left to the handlers
+        if (!(char.IsLetterOrDigit(c) || c == '_' || c == '\'' || c == '"'
+            || c == '/' || c == '[' || c == ':' || c == '*' || c == '.' || c == '#'
+            || c == '@' || c == '$' || c == '('))
+            throw new CliException($"Malformed selector: \"{selector}\" does not start with an element name, a cell reference or a path.")
+            {
+                Code = "invalid_selector",
+                Suggestion = "Start with an element type, e.g. cell[value>5], shape[text~=Hello], p[bold=true], or a path like /Sheet1/A1."
+            };
+
+        // The same empty element token also arises AFTER a separator: a sheet
+        // prefix with nothing behind it (`Sheet1!`), a trailing or doubled
+        // combinator (`slide[1]>`, `slide[1]>>shape`), an empty pseudo-class
+        // (`cell:`). Look only at top-level text — a '>' or '!' inside a
+        // predicate value is literal.
+        var outside = System.Text.RegularExpressions.Regex.Replace(s, @"\[[^\]]*\]|'[^']*'|""[^""]*""", "").TrimEnd();
+        if (outside.Length > 0 && (outside[^1] is '>' or '!' or ':' or ',' || outside.Contains(">>")))
+            throw new CliException($"Malformed selector: \"{selector}\" has no element name after '{(outside.Contains(">>") ? ">>" : outside[^1].ToString())}'.")
+            {
+                Code = "invalid_selector",
+                Suggestion = "Name the element, e.g. Sheet1!cell, slide[1]>shape, cell:contains(text)."
+            };
+    }
+
+    /// <summary>
+    /// Split a selector at its top-level `>` when the PARENT side carries a
+    /// filter predicate (anything but positional `[N]`). Unfiltered parents
+    /// (`table > row`, `/body/tbl[2] > tr`) keep the handlers' own combinator path.
+    /// </summary>
+    private static bool TrySplitFilteredCombinator(string selector, out string parent, out string child)
+    {
+        parent = child = "";
+        int idx = ChildCombinatorIndex(selector);
+        if (idx < 0) return false;
+        var blocks = ExtractBracketBlocks(selector[..idx], out bool balanced);
+        if (!balanced || !blocks.Any(b => !string.IsNullOrWhiteSpace(b) && !int.TryParse(b.Trim(), out _)))
+            return false;
+        parent = selector[..idx].Trim();
+        child = selector[(idx + 1)..].Trim();
+        return parent.Length > 0 && child.Length > 0;
+    }
+
+    /// <summary>
+    /// `parent[pred] > child[pred]`: the parents are filtered by the full engine
+    /// (so `or`, comparisons and every key the parent node exposes work, the same
+    /// as querying the parent alone), the children of that parent TYPE are
+    /// filtered by their own predicates, and a child is kept only when it lies
+    /// inside one of the matching parents. A parent condition that matches
+    /// nothing therefore matches nothing, with the parent's own diagnostic.
+    /// </summary>
+    private static (List<DocumentNode> Results, List<FilterDiagnostic> Warnings) FilterCombinator(
+        string parentSel, string childSel, Func<string, List<DocumentNode>> query,
+        Func<string, string>? keyResolver, bool applyAll)
+    {
+        // A scoped parent (`/body/p[text=X]`, `/slide[1]/table[name=T2]`) is
+        // queried as its bare element and then kept inside the scope: not every
+        // handler accepts a path-prefixed selector on Query (Word does not), but
+        // every node carries its full path.
+        var (scope, parentQuery) = SplitScope(parentSel);
+        var (parents, parentWarnings) = FilterSelector(parentQuery, query, keyResolver, applyAll: true);
+        if (scope.Length > 0)
+            parents = parents.Where(p => p.Path != null
+                && p.Path.StartsWith(scope + "/", StringComparison.OrdinalIgnoreCase)).ToList();
+        if (parents.Count == 0) return (new List<DocumentNode>(), parentWarnings);
+
+        // A positional child (`tr[1]`, `tr[last()]`) means the Nth child OF EACH
+        // matching parent (XPath `table/tr[1]`). The handlers' combinator code
+        // either ignores it or counts across the whole document, so it is taken
+        // out of the child query and applied per parent below.
+        var position = TakeChildPosition(ref childSel);
+
+        // The child query uses the bare parent element as well; the scope is
+        // already enforced by the parents the children must lie inside.
+        var (children, childWarnings) = FilterSelector(
+            StripFilterBrackets(parentQuery).TrimEnd() + " > " + childSel, query, keyResolver, applyAll);
+        var kept = new List<DocumentNode>();
+        foreach (var parent in parents)
+        {
+            var mine = children.Where(c => IsInside(c.Path, parent.Path) && !kept.Contains(c)).ToList();
+            if (position == null) kept.AddRange(mine);
+            else if (position == int.MaxValue) { if (mine.Count > 0) kept.Add(mine[^1]); }
+            else if (position <= mine.Count) kept.Add(mine[position.Value - 1]);
+        }
+        return (kept, childWarnings);
+    }
+
+    // "/body/p[text=a/b]" -> ("/body", "p[text=a/b]"); a '/' inside a bracket is
+    // value text. No leading '/' -> no scope.
+    private static (string Scope, string Element) SplitScope(string selector)
+    {
+        if (!selector.StartsWith("/")) return ("", selector);
+        int depth = 0, last = -1;
+        for (int i = 0; i < selector.Length; i++)
+        {
+            switch (selector[i])
+            {
+                case '[': depth++; break;
+                case ']': depth--; break;
+                case '/' when depth == 0: last = i; break;
+            }
+        }
+        return last <= 0 ? ("", selector.TrimStart('/')) : (selector[..last], selector[(last + 1)..]);
+    }
+
+    // `[N]` / `[last()]` directly on the child element; returns the position
+    // (int.MaxValue for last()) and removes it from the selector.
+    private static readonly Regex ChildPositionRegex = new(
+        @"\[\s*(?<n>\d+|last\(\))\s*\]", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+    private static int? TakeChildPosition(ref string childSel)
+    {
+        var m = ChildPositionRegex.Match(childSel);
+        if (!m.Success) return null;
+        childSel = childSel.Remove(m.Index, m.Length);
+        var n = m.Groups["n"].Value;
+        if (n.StartsWith("last", StringComparison.OrdinalIgnoreCase)) return int.MaxValue;
+        var v = int.Parse(n, System.Globalization.CultureInfo.InvariantCulture);
+        return v < 1 ? 0 : v;
+    }
+
+    // xlsx addresses a cell by its A1 name, not under its row / column node:
+    // /Sheet1/row[3] holds /Sheet1/B3, /Sheet1/col[B] holds /Sheet1/B3.
+    private static readonly Regex XlsxRowPath = new(@"^(?<sheet>.+)/row\[(?<n>\d+)\]$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex XlsxColPath = new(@"^(?<sheet>.+)/col\[(?<c>[A-Za-z]+)\]$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex XlsxCellPath = new(@"^(?<sheet>.+)/(?<c>[A-Za-z]{1,3})(?<n>\d+)$", RegexOptions.Compiled);
+
+    /// <summary>True when the node at <paramref name="childPath"/> lies inside the node at <paramref name="parentPath"/>.</summary>
+    private static bool IsInside(string? childPath, string? parentPath)
+    {
+        if (string.IsNullOrEmpty(childPath) || string.IsNullOrEmpty(parentPath)) return false;
+        var parent = parentPath.TrimEnd('/');
+        if (childPath.StartsWith(parent + "/", StringComparison.OrdinalIgnoreCase)) return true;
+        var cell = XlsxCellPath.Match(childPath);
+        if (!cell.Success) return false;
+        var row = XlsxRowPath.Match(parent);
+        if (row.Success)
+            return string.Equals(row.Groups["sheet"].Value, cell.Groups["sheet"].Value, StringComparison.OrdinalIgnoreCase)
+                   && row.Groups["n"].Value == cell.Groups["n"].Value;
+        var col = XlsxColPath.Match(parent);
+        if (col.Success)
+            return string.Equals(col.Groups["sheet"].Value, cell.Groups["sheet"].Value, StringComparison.OrdinalIgnoreCase)
+                   && string.Equals(col.Groups["c"].Value, cell.Groups["c"].Value, StringComparison.OrdinalIgnoreCase);
+        return false;
+    }
+
     public static (List<DocumentNode> Results, List<FilterDiagnostic> Warnings) FilterSelector(
         string selector, Func<string, List<DocumentNode>> query, Func<string, string>? keyResolver = null,
         bool applyAll = true)
@@ -951,6 +1136,17 @@ internal static class AttributeFilter
             }
             return (unionResults, unionWarnings);
         }
+
+        RejectGarbageSelectorHead(selector);
+
+        // `parent[pred] > child`: resolve the parent's predicates on the PARENTS,
+        // then keep the children that sit under a matching parent. Handled here,
+        // once, for every format — the handlers' own combinator code returns the
+        // children of every parent of that type and (except Word's paragraph
+        // gate) ignores the parent's predicates, so a predicate left to them
+        // vanished and an unmatched parent selected every child (#418).
+        if (TrySplitFilteredCombinator(selector, out var parentSel, out var childSel))
+            return FilterCombinator(parentSel, childSel, query, keyResolver, applyAll);
 
         var expr = ParseExpr(selector);
         if (expr != null && keyResolver != null)

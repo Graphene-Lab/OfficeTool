@@ -38,11 +38,26 @@ public partial class ExcelHandler
             $"Unknown totals-row function '{tok}'. Valid: sum, average, count, countNums, max, min, stdDev, var, none, custom.")
     };
 
+    /// <summary>
+    /// Text of a CT_Rst — a shared-string item (<c>&lt;si&gt;</c>) or an inline
+    /// string (<c>&lt;is&gt;</c>) — EXCLUDING its <c>&lt;rPh&gt;</c> phonetic
+    /// guide. Issue #343: <c>InnerText</c> concatenates the guide into the value,
+    /// so a Japanese cell read back as "項目コウモク" instead of "項目". The guide
+    /// annotates the base text rather than being part of it, and is surfaced
+    /// separately as <c>Format["phonetic"]</c>. Both SDK types derive from
+    /// RstType, so every cell-text read shares this one rule.
+    /// </summary>
+    internal static string RstTextWithoutPhonetic(RstType? rst)
+        => rst == null
+            ? ""
+            : rst.Text?.Text
+                ?? string.Concat(rst.Elements<Run>().Select(r => r.Text?.Text ?? ""));
+
     private string GetCellDisplayValue(Cell cell, Core.FormulaEvaluator? evaluator = null)
     {
         if (cell.DataType?.Value == CellValues.InlineString)
         {
-            return cell.InlineString?.InnerText ?? "";
+            return RstTextWithoutPhonetic(cell.InlineString);
         }
 
         var value = cell.CellValue?.Text ?? "";
@@ -52,8 +67,8 @@ public partial class ExcelHandler
             var sst = _doc.WorkbookPart?.GetPartsOfType<SharedStringTablePart>().FirstOrDefault();
             if (sst?.SharedStringTable != null && int.TryParse(value, out int idx))
             {
-                var item = sst.SharedStringTable.Elements<SharedStringItem>().ElementAtOrDefault(idx);
-                return item?.InnerText ?? value;
+                var item = SharedStringAt(sst.SharedStringTable, idx);
+                if (item != null) return RstTextWithoutPhonetic(item);
             }
         }
 
@@ -69,7 +84,7 @@ public partial class ExcelHandler
         // distinguish "formula not evaluated" from "cell contains the literal
         // text `=FOO`". The sentinel matches Excel's `#…!` error-code shape
         // so it sorts visually next to #REF!/#VALUE!/etc.
-        if (string.IsNullOrEmpty(value) && cell.CellFormula?.Text != null)
+        if (string.IsNullOrEmpty(value) && Core.SharedFormulaResolver.ResolveText(cell) is { } formulaText)
         {
             // Missing-sheet refs: ResolveSheetCellResult silently returns 0
             // and the error path surfaces a fake #REF!. Neither value is
@@ -77,11 +92,11 @@ public partial class ExcelHandler
             // that suppresses computedValue and reports evaluated=false —
             // view text must emit the sentinel to keep the two readbacks
             // (view text vs Format["evaluated"]) consistent.
-            if (FormulaReferencesMissingSheet(cell.CellFormula.Text))
+            if (FormulaReferencesMissingSheet(formulaText))
                 return "#OCLI_NOTEVAL!";
             if (evaluator != null)
             {
-                var report = evaluator.EvaluateForReport(cell.CellFormula.Text);
+                var report = evaluator.EvaluateForReport(formulaText);
                 if (report.Status == Core.EvalReportStatus.Evaluated)
                     return report.Result!.ToCellValueText();
                 // Error values (#DIV/0!, #VALUE!, …) surface directly so users
@@ -413,8 +428,9 @@ public partial class ExcelHandler
             || value.Equals("-Infinity", StringComparison.Ordinal)
             || value.Equals("+Infinity", StringComparison.Ordinal))
             return (1, 0.0, value);
-        if (double.TryParse(value, System.Globalization.NumberStyles.Any,
-            System.Globalization.CultureInfo.InvariantCulture, out var num))
+        // Same numeric definition as storage and formulas: "1,5" is text, so it
+        // sorts with the strings instead of landing between 14 and 16.
+        if (Core.NumericText.TryParse(value, out var num))
         {
             // Defensive: even non-literal inputs can produce non-finite doubles
             // (e.g. "1e999" overflows to +Infinity). Keep those in the string bucket.
@@ -485,6 +501,65 @@ public partial class ExcelHandler
             _rowIndex?.Remove(sheetData);
         else
             _rowIndex = null;
+    }
+
+    /// <summary>
+    /// The shared-string item (<c>&lt;si&gt;</c>) a cell's <c>&lt;v&gt;</c> index refers
+    /// to, in document order, or null when the table is absent or the index is not in
+    /// it. Every reader of a shared-string cell must resolve through here rather than
+    /// <c>table.Elements&lt;SharedStringItem&gt;().ElementAtOrDefault(idx)</c>: that
+    /// enumerable is a lazy iterator, so it re-walks the table from the head on each
+    /// call and a whole-sheet read becomes O(n²) in the table's length (issue #435).
+    /// </summary>
+    private SharedStringItem? SharedStringAt(SharedStringTable? table, int index)
+    {
+        // Negative indices were already out of range for ElementAtOrDefault, which
+        // returns default rather than throwing; keep that answer.
+        if (table == null || index < 0)
+            return null;
+
+        var items = SharedStringItems(table);
+        if (index < items.Count)
+            return items[index];
+
+        // Past the end of the cached list. The table is append-only in this codebase
+        // (nothing removes or replaces an <si>; the three growth sites are in
+        // ExcelHandler.Add.Cells.cs), so a stale list is always too SHORT, never
+        // wrong — a miss is therefore exactly the signal to re-read, and re-reading
+        // keeps the worst case (a file naming an index the table does not have) at the
+        // O(n) walk it has today instead of turning it into a wrong answer.
+        _sharedStringIndex?.Remove(table);
+        items = SharedStringItems(table);
+        return index < items.Count ? items[index] : null;
+    }
+
+    /// <summary>
+    /// The materialized <c>&lt;si&gt;</c> list of one table, built on first use.
+    /// Shared by every lookup so the walk happens once per table, not once per cell.
+    /// </summary>
+    private List<SharedStringItem> SharedStringItems(SharedStringTable table)
+    {
+        _sharedStringIndex ??= new();
+        if (!_sharedStringIndex.TryGetValue(table, out var items))
+        {
+            items = table.Elements<SharedStringItem>().ToList();
+            _sharedStringIndex[table] = items;
+        }
+        return items;
+    }
+
+    /// <summary>
+    /// Drop the cached shared-string list for one table (or all tables if null).
+    /// Must be called wherever items are appended to the table — the table's indices
+    /// are positional, so a new <c>&lt;si&gt;</c> shifts nothing but invalidates the
+    /// list's length.
+    /// </summary>
+    private void InvalidateSharedStringIndex(SharedStringTable? table = null)
+    {
+        if (table != null)
+            _sharedStringIndex?.Remove(table);
+        else
+            _sharedStringIndex = null;
     }
 
     private Cell FindOrCreateCell(SheetData sheetData, string cellRef)

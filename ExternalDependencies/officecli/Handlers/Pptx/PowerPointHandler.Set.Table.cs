@@ -39,7 +39,7 @@ public partial class PowerPointHandler
         }
         catch
         {
-            cell.Parent?.ReplaceChild(cellBackup, cell);
+            OfficeCli.Core.ElementRollback.RestoreInPlace(cell, cellBackup);
             throw;
         }
     }

@@ -56,7 +56,7 @@ internal partial class FormulaEvaluator
         return true;
 
         static bool TryNum(string x, out double d) =>
-            double.TryParse(x, NumberStyles.Any, CultureInfo.InvariantCulture, out d);
+            NumericText.TryParse(x, out d);
     }
 
     // Format a Complex the way Excel does: "3+4i", "3-4i", "5", "i", "-i", "2i".

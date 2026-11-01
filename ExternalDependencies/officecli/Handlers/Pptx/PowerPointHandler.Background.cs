@@ -887,6 +887,25 @@ public partial class PowerPointHandler
         return dash;
     }
 
+    /// <summary>
+    /// Read a top-level comma in a gradient spec as the '-' stop separator.
+    /// Commas inside parentheses belong to a color function such as
+    /// rgb(255,0,0) and are kept.
+    /// </summary>
+    private static string CommasToStopSeparators(string spec)
+    {
+        if (!spec.Contains(',')) return spec;
+        var sb = new System.Text.StringBuilder(spec.Length);
+        int depth = 0;
+        foreach (var ch in spec)
+        {
+            if (ch == '(') depth++;
+            else if (ch == ')' && depth > 0) depth--;
+            sb.Append(ch == ',' && depth == 0 ? '-' : ch);
+        }
+        return sb.ToString();
+    }
+
     internal static Drawing.GradientFill BuildGradientFill(string value)
     {
         // ReadGradientString emits semicolon-separated form
@@ -896,6 +915,10 @@ public partial class PowerPointHandler
         // their own colon-prefix syntax which uses dashes between colors.
         if (value.StartsWith("linear;", StringComparison.OrdinalIgnoreCase))
             value = value[7..].Replace(';', '-');
+
+        // Stops may also be comma-separated ("FF0000@0,0000FF@100"). Without
+        // this the whole list was one segment and silently became a solid fill.
+        value = CommasToStopSeparators(value);
 
         // Check for radial/path prefix
         string? gradientType = null;

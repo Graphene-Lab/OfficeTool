@@ -39,6 +39,10 @@ internal static class SkillInstaller
         (["openclaw"],                    "OpenClaw",       ".openclaw",            Path.Combine(".openclaw", "skills")),
         (["nanobot"],                     "NanoBot",        Path.Combine(".nanobot", "workspace"),   Path.Combine(".nanobot", "workspace", "skills")),
         (["zeroclaw"],                    "ZeroClaw",       Path.Combine(".zeroclaw", "workspace"),  Path.Combine(".zeroclaw", "workspace", "skills")),
+        // DeepSeek Harness (deepseek-ai/deepseek-harness) scans <dshHome>/skills
+        // where dshHome is $DSH_HOME or ~/.dsh (packages/skill/skill-filesystem).
+        // It also scans ~/.agents/skills, already covered by the Codex CLI row.
+        (["dsh", "deepseek-harness"],     "DeepSeek Harness", ".dsh",               Path.Combine(".dsh", "skills")),
     ];
 
     // Guide name → skill folder name mapping
@@ -414,7 +418,7 @@ internal static class SkillInstaller
         if (tool.Aliases is null)
         {
             Console.Error.WriteLine($"Unknown agent: {agentKey}");
-            Console.Error.WriteLine("Supported: claude, copilot, codex, cursor, pi, windsurf, minimax, opencode, openclaw, nanobot, zeroclaw, hermes");
+            Console.Error.WriteLine("Supported: claude, copilot, codex, cursor, pi, windsurf, minimax, opencode, openclaw, nanobot, zeroclaw, hermes, dsh");
             return installed;
         }
 
@@ -475,7 +479,7 @@ internal static class SkillInstaller
         }
 
         Console.Error.WriteLine($"Unknown target: {agentKey}");
-        Console.Error.WriteLine("Supported agents: claude, copilot, codex, cursor, windsurf, minimax, opencode, openclaw, nanobot, zeroclaw, hermes, all");
+        Console.Error.WriteLine("Supported agents: claude, copilot, codex, cursor, pi, windsurf, minimax, opencode, openclaw, nanobot, zeroclaw, hermes, dsh, all");
         if (SkillMap.ContainsKey(agentKey))
         {
             Console.Error.WriteLine();

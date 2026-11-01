@@ -236,6 +236,18 @@
       ],
       "readback": "email | print | hqprint | screen",
       "enforcement": "report"
-    }
+    },
+    "phType": {"type": "string", "add": false, "set": false, "get": true, "description": "placeholder slot type when the picture fills a picture placeholder (PlaceholderShape/@type, e.g. picture); absent on free-standing pictures.", "readback": "placeholder type token", "enforcement": "report"},
+    "phIndex": {"type": "number", "add": false, "set": false, "get": true, "description": "placeholder slot index (PlaceholderShape/@idx) when the picture fills a placeholder.", "readback": "integer", "enforcement": "report"},
+    "phBare": {"type": "bool", "add": false, "set": false, "get": true, "description": "true when the picture carries a bare <p:ph/> with neither type nor idx.", "readback": "true only", "enforcement": "report"},
+    "effective.x": {"type": "length", "add": false, "set": false, "get": true, "description": "resolved x inherited from the layout/master placeholder slot when the element carries no own xfrm; absent when the element owns its frame (bare x is reported instead).", "readback": "length string", "enforcement": "report"},
+    "effective.x.src": {"type": "string", "add": false, "set": false, "get": true, "description": "slot that supplies effective.x, e.g. /slide[1]/layout/ph[@type=pic][@idx=1].", "readback": "path string", "enforcement": "report"},
+    "effective.y": {"type": "length", "add": false, "set": false, "get": true, "description": "resolved y inherited from the layout/master placeholder slot when the element carries no own xfrm; absent when the element owns its frame (bare y is reported instead).", "readback": "length string", "enforcement": "report"},
+    "effective.y.src": {"type": "string", "add": false, "set": false, "get": true, "description": "slot that supplies effective.y, e.g. /slide[1]/layout/ph[@type=pic][@idx=1].", "readback": "path string", "enforcement": "report"},
+    "effective.width": {"type": "length", "add": false, "set": false, "get": true, "description": "resolved width inherited from the layout/master placeholder slot when the element carries no own xfrm; absent when the element owns its frame (bare width is reported instead).", "readback": "length string", "enforcement": "report"},
+    "effective.width.src": {"type": "string", "add": false, "set": false, "get": true, "description": "slot that supplies effective.width, e.g. /slide[1]/layout/ph[@type=pic][@idx=1].", "readback": "path string", "enforcement": "report"},
+    "effective.height": {"type": "length", "add": false, "set": false, "get": true, "description": "resolved height inherited from the layout/master placeholder slot when the element carries no own xfrm; absent when the element owns its frame (bare height is reported instead).", "readback": "length string", "enforcement": "report"},
+    "effective.height.src": {"type": "string", "add": false, "set": false, "get": true, "description": "slot that supplies effective.height, e.g. /slide[1]/layout/ph[@type=pic][@idx=1].", "readback": "path string", "enforcement": "report"},
+    "hidden": {"type": "bool", "add": false, "set": false, "get": true, "description": "true when <p:cNvPr hidden=\"1\"> marks the element as not drawn; the HTML/SVG previews skip it. Not the slide-level hidden (show=\"0\").", "readback": "true only", "enforcement": "report"}
   }
 }

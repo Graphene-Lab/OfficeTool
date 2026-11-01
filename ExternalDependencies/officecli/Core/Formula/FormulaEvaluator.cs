@@ -55,7 +55,7 @@ internal record FormulaResult
         if (IsRange) return FirstCell()?.AsNumber() ?? 0;
         if (NumericValue.HasValue) return NumericValue.Value;
         if (BoolValue.HasValue) return BoolValue.Value ? 1 : 0;
-        if (IsString && double.TryParse(StringValue, NumberStyles.Any, CultureInfo.InvariantCulture, out var s)) return s;
+        if (IsString && NumericText.TryParse(StringValue, out var s)) return s;
         return 0;
     }
     public string AsString() => IsRange ? (FirstCell()?.AsString() ?? "") :
@@ -200,6 +200,14 @@ internal sealed class FormulaEvalSession
     // cycle-free evaluations are stored; the seed-0 value a circular chain
     // returns depends on the entry point and must never be reused.
     internal readonly Dictionary<string, FormulaResult> CellMemo = new(StringComparer.OrdinalIgnoreCase);
+    // Results that DID hit the circular fallback, kept only for the current
+    // root evaluation (cleared when a new top-level formula starts). Within one
+    // root the cycle is broken at a fixed point, so re-evaluating the same cell
+    // again cannot produce a different value; without this memo every cell
+    // downstream of a 0-seeded cycle was recomputed on each reference and an
+    // auto-number chain over a self-referencing seed took exponential time
+    // (issue #456: 22 rows → 56 s, 240 rows → never finished).
+    internal readonly Dictionary<string, FormulaResult> CycleMemo = new(StringComparer.OrdinalIgnoreCase);
     // Populated-extent cache for whole-column/row clamping ("A:A" → used rows).
     // Keyed by SheetData reference; evaluation never adds/removes rows or cells,
     // so the extent is stable for the session's lifetime.
@@ -211,6 +219,15 @@ internal sealed class FormulaEvalSession
     // difference between minutes and seconds on formula-heavy workbooks. Safe for
     // the same reason CellMemo is: cell results are stable within a session.
     internal readonly Dictionary<string, RangeData> RangeMemo = new(StringComparer.OrdinalIgnoreCase);
+    // Materialized <si> items per shared-strings table. A cell reference resolves
+    // in row order and `Elements<SharedStringItem>()` is a lazy iterator, so
+    // `ElementAtOrDefault(idx)` walks the table from the head on every reference
+    // — O(idx) each, O(n²) per sheet of shared-string references (issue #435:
+    // 40,000 rows of `=A{i}` took 15.6s against the table and 1.4s against the
+    // same strings written inline). Evaluation never adds or removes an item, so
+    // the list is stable for the session's lifetime — the argument
+    // RowExtentBySheet above already makes.
+    internal readonly Dictionary<SharedStringTable, List<SharedStringItem>> SharedStringItemsByTable = new();
     internal int CircularHits;
     internal int CrossSheetDepth;
 }
@@ -312,7 +329,7 @@ internal partial class FormulaEvaluator
     {
         try
         {
-            if (_depth == 0) { _visiting.Clear(); _expandingNames.Clear(); }
+            if (_depth == 0) { _visiting.Clear(); _expandingNames.Clear(); _session.CycleMemo.Clear(); }
             // Accept both qualified (`_xlfn.SEQUENCE`) and bare (`SEQUENCE`)
             // forms. Stored XML uses the qualified form post-R11-2; user code
             // and tests still pass the canonical name.
@@ -873,7 +890,7 @@ internal partial class FormulaEvaluator
         if (r.IsBlank) { val = 0; return true; }
         if (r.IsString)
         {
-            if (double.TryParse(r.StringValue, NumberStyles.Any, CultureInfo.InvariantCulture, out val))
+            if (NumericText.TryParse(r.StringValue, out val))
                 return true;
             // Excel coerces date/time-formatted text to its serial in arithmetic
             // (e.g. "2024-08-01" - "2024-08-01" = 0), so fall back to date parsing
@@ -887,7 +904,10 @@ internal partial class FormulaEvaluator
             if (Regex.IsMatch(s, @"^\d{1,2}:\d{2}(:\d{2})?$")
                 && TimeSpan.TryParse(s, CultureInfo.InvariantCulture, out var ts))
             { val = ts.TotalDays; return true; }
-            if (DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt))
+            // "1,5" is a decimal comma, not January 5 — DateTime.TryParse
+            // would hand back that date's serial and multiply it.
+            if (!NumericText.IsDecimalCommaSpelling(s)
+                && DateTime.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.None, out var dt))
             { val = dt.ToOADate(); return true; }
             return false;
         }
@@ -937,7 +957,7 @@ internal partial class FormulaEvaluator
         if (s.Equals("TRUE", StringComparison.OrdinalIgnoreCase)) return FormulaResult.Bool(true);
         if (s.Equals("FALSE", StringComparison.OrdinalIgnoreCase)) return FormulaResult.Bool(false);
         if (s.StartsWith('#') && s.EndsWith('!')) return FormulaResult.Error(s);
-        if (double.TryParse(s, NumberStyles.Any, CultureInfo.InvariantCulture, out var n)) return FormulaResult.Number(n);
+        if (NumericText.TryParse(s, out var n)) return FormulaResult.Number(n);
         return FormulaResult.Str(s);
     }
 
@@ -989,7 +1009,7 @@ internal partial class FormulaEvaluator
         var tok = t[p];
         switch (tok.Type)
         {
-            case TT.Number: p++; return double.TryParse(tok.Value, NumberStyles.Any, CultureInfo.InvariantCulture, out var n) ? FormulaResult.Number(n) : null;
+            case TT.Number: p++; return NumericText.TryParse(tok.Value, out var n) ? FormulaResult.Number(n) : null;
             case TT.String: p++; return FormulaResult.Str(tok.Value);
             case TT.Bool: p++; return FormulaResult.Bool(tok.Value == "TRUE");
             case TT.CellRef: p++; return ResolveCellResult(tok.Value);
@@ -1212,6 +1232,27 @@ internal partial class FormulaEvaluator
 
     // ==================== Cell & Range Resolution ====================
 
+    /// <summary>
+    /// The shared-string item a cell's index refers to, resolved through the
+    /// session's materialized list — see
+    /// <see cref="FormulaEvalSession.SharedStringItemsByTable"/> for why the table
+    /// is walked once per session rather than once per reference.
+    /// </summary>
+    private SharedStringItem? SharedStringAt(SharedStringTable table, int index)
+    {
+        // Negative indices were already out of range for ElementAtOrDefault, which
+        // returns default rather than throwing; keep that answer.
+        if (index < 0)
+            return null;
+
+        if (!_session.SharedStringItemsByTable.TryGetValue(table, out var items))
+        {
+            items = table.Elements<SharedStringItem>().ToList();
+            _session.SharedStringItemsByTable[table] = items;
+        }
+        return index < items.Count ? items[index] : null;
+    }
+
     internal FormulaResult? ResolveCellResult(string cellRef)
     {
         cellRef = StripDollar(cellRef).ToUpperInvariant();
@@ -1232,7 +1273,11 @@ internal partial class FormulaEvaluator
             // If cell has a formula, always evaluate it (cached values may be stale).
             // Guard recursive evaluation against an uncatchable StackOverflow that
             // would kill the resident process (DoS).
-            if (cell.CellFormula?.Text != null)
+            // A shared-formula child carries an empty <f/>; resolve it to the
+            // master's displaced text, otherwise the child evaluates to blank and
+            // every dependent is recomputed from that blank.
+            var refFormula = SharedFormulaResolver.ResolveText(cell, _sheetData);
+            if (!string.IsNullOrEmpty(refFormula))
             {
                 // Memoized? Referenced formula cells are re-evaluated (their
                 // cached <v> may be stale), but within one session the formula's
@@ -1242,6 +1287,8 @@ internal partial class FormulaEvaluator
                 // computed under bindings must not leak into other contexts.
                 if (_bindings.Count == 0 && _session.CellMemo.TryGetValue(qualifiedRef, out var memoized))
                     return memoized;
+                if (_bindings.Count == 0 && _session.CycleMemo.TryGetValue(qualifiedRef, out var cycleMemoized))
+                    return cycleMemoized;
                 // Primary: probe the real remaining stack (adapts to formula
                 // complexity, so complex nested formulas are covered too).
                 // Secondary: a high fixed backstop. Over either, surface a
@@ -1267,7 +1314,7 @@ internal partial class FormulaEvaluator
                 try
                 {
                     var circularBefore = _session.CircularHits;
-                    var evaluated = EvaluateFormula(ModernFunctionQualifier.Unqualify(cell.CellFormula.Text));
+                    var evaluated = EvaluateFormula(ModernFunctionQualifier.Unqualify(refFormula));
                     if (evaluated != null)
                     {
                         // Memoize only clean results: no live bindings (see lookup
@@ -1275,9 +1322,13 @@ internal partial class FormulaEvaluator
                         // evaluation (a 0-seeded cycle result depends on where the
                         // cycle was entered). Lambdas capture evaluator state and
                         // are not safe to replay.
-                        if (_bindings.Count == 0 && !evaluated.IsLambda
-                            && circularBefore == _session.CircularHits)
-                            _session.CellMemo[qualifiedRef] = evaluated;
+                        if (_bindings.Count == 0 && !evaluated.IsLambda)
+                        {
+                            if (circularBefore == _session.CircularHits)
+                                _session.CellMemo[qualifiedRef] = evaluated;
+                            else
+                                _session.CycleMemo[qualifiedRef] = evaluated;
+                        }
                         return evaluated;
                     }
                 }
@@ -1296,9 +1347,10 @@ internal partial class FormulaEvaluator
             {
                 if (cell.DataType?.Value == CellValues.SharedString)
                 {
-                    var sst = _workbookPart?.GetPartsOfType<SharedStringTablePart>().FirstOrDefault();
-                    if (sst?.SharedStringTable != null && int.TryParse(cached, out int idx))
-                        return FormulaResult.Str(sst.SharedStringTable.Elements<SharedStringItem>().ElementAtOrDefault(idx)?.InnerText ?? cached);
+                    var sst = _workbookPart?.GetPartsOfType<SharedStringTablePart>()
+                        .FirstOrDefault()?.SharedStringTable;
+                    if (sst != null && int.TryParse(cached, out int idx))
+                        return FormulaResult.Str(SharedStringAt(sst, idx)?.InnerText ?? cached);
                     return FormulaResult.Str(cached);
                 }
                 if (cell.DataType?.Value == CellValues.Boolean) return FormulaResult.Bool(cached == "1");
@@ -1308,7 +1360,7 @@ internal partial class FormulaEvaluator
                 // #REF! instead of coercing the cached string to a number.
                 if (cell.DataType?.Value == CellValues.Error) return FormulaResult.Error(cached);
                 if (cell.DataType?.Value == CellValues.String || cell.DataType?.Value == CellValues.InlineString) return FormulaResult.Str(cached);
-                return double.TryParse(cached, NumberStyles.Any, CultureInfo.InvariantCulture, out var v) ? FormulaResult.Number(v) : FormulaResult.Str(cached);
+                return NumericText.TryParse(cached, out var v) ? FormulaResult.Number(v) : FormulaResult.Str(cached);
             }
 
             return FormulaResult.Blank();

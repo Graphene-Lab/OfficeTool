@@ -592,6 +592,19 @@ public partial class WordHandler
         {
             anchor = wrapAnchor;
         }
+        // Issue #402: `query run` flattens runs nested in inline containers
+        // (w:ins / w:del / w:hyperlink / w:sdt …) into the paragraph's r[N]
+        // sequence, so an explicit anchor may resolve to a run that is not a
+        // DIRECT child of the parent. Re-target it to its paragraph-level
+        // ancestor: --after inserts after the whole container, --before in
+        // front of it. (The find: path goes further and splits the container
+        // at the exact offset; an explicit run anchor is a whole-run anchor.)
+        if (!siblings.Contains(anchor))
+        {
+            var top = anchor;
+            while (top.Parent != null && !ReferenceEquals(top.Parent, parent)) top = top.Parent;
+            if (ReferenceEquals(top.Parent, parent)) anchor = top;
+        }
         var anchorIdx = siblings.IndexOf(anchor);
         if (anchorIdx < 0)
             throw new ArgumentException($"Anchor element is not a child of {parentPath}: {anchorPath}");
@@ -905,6 +918,9 @@ public partial class WordHandler
     // call. dump emits one such lookup per bookmarkEnd, so a document with N
     // bookmarks cost O(N²) (a 6940-bookmark FedRAMP SSP spent tens of seconds
     // here alone). Keyed by scope root (Body) so the map is built once.
+    // Invalidated by ClearNavChildCaches, NOT only ClearBodyChildIndex: the map
+    // covers bookmarks nested anywhere in the body, so a bookmark added under a
+    // paragraph (parent != Body) must drop it too.
     private Dictionary<OpenXmlElement, Dictionary<string, BookmarkStart>>? _bookmarkStartByIdCache;
 
     // Per-container child-index caches for the SAME O(n²) shape the body caches
@@ -929,23 +945,26 @@ public partial class WordHandler
         _bodyChildIndexCache.Clear();
         _owningSectionCache = null;
         _bodyParaByIdCache = null;
-        _bookmarkStartByIdCache = null;
         ClearNavChildCaches();
     }
 
-    // Drop the run / row / cell child-index caches. Split out from
-    // ClearBodyChildIndex because these must invalidate on a WIDER set of
-    // mutations than the body-direct caches: adding/removing a run under a
-    // PARAGRAPH (parent != Body) leaves the body child-index valid but makes a
-    // cached /<para>/r[K] list stale. Add() therefore calls this unconditionally
-    // at entry (not gated on `parent is Body`), while body-direct mutations reach
-    // it via ClearBodyChildIndex. A bare Dictionary.Clear() is O(1)-ish and dump
+    // Drop the caches that index structure BELOW the body-direct level: the
+    // run / row / cell child-index lists and the bookmark id → start map. Split
+    // out from ClearBodyChildIndex because these must invalidate on a WIDER set
+    // of mutations than the body-direct caches: adding a run, or a bookmark /
+    // bookmarkEnd, under a PARAGRAPH (parent != Body) leaves the body
+    // child-index valid but makes a cached /<para>/r[K] list — or the bookmark
+    // map, which spans every BookmarkStart in the body — stale. Add() and
+    // structural Set() reach this on EXIT via NavCacheClearGuard (not gated on
+    // `parent is Body`); Remove/Move/Swap/CopyFrom and RawSet reach it via
+    // ClearBodyChildIndex. Clearing is a bare Dictionary.Clear()/null and dump
     // (the hit-heavy path) never mutates, so over-clearing costs nothing.
     private void ClearNavChildCaches()
     {
         _navRunIndexCache.Clear();
         _navRowIndexCache.Clear();
         _navCellIndexCache.Clear();
+        _bookmarkStartByIdCache = null;
     }
 
     // Cached, filtered run list for /<container>/r[K] resolution. The filter is
@@ -1997,7 +2016,10 @@ public partial class WordHandler
         // generic InnerText fallback below would return " fn-text".
         node.Text = GetFootnoteText(fnEl);
         if (fnEl.Id?.Value != null) node.Format["id"] = fnEl.Id.Value;
-        if (fnEl.Type?.Value != null) node.Format["type"] = fnEl.Type.InnerText;
+        // Read InnerText, never .Value (would parse the enum and throw on an
+        // unrecognized token — same crash class as #324's table jc).
+        if (fnEl.Type != null && !string.IsNullOrEmpty(fnEl.Type.InnerText))
+            node.Format["type"] = fnEl.Type.InnerText;
         // R44 minor-5: surface first-run formatting on footnote node so
         // bold/italic/size/color set via Add/Set round-trip through Get.
         // Mirrors the hyperlink firstRun pattern at line ~2746 above.
@@ -2085,7 +2107,9 @@ public partial class WordHandler
         node.Type = "endnote";
         node.Text = GetFootnoteText(enEl);
         if (enEl.Id?.Value != null) node.Format["id"] = enEl.Id.Value;
-        if (enEl.Type?.Value != null) node.Format["type"] = enEl.Type.InnerText;
+        // Read InnerText, never .Value (see #324 — parsing an unknown enum throws).
+        if (enEl.Type != null && !string.IsNullOrEmpty(enEl.Type.InnerText))
+            node.Format["type"] = enEl.Type.InnerText;
         // R44 minor-5: mirror footnote firstRun readback for endnote.
         var enFirstRun = enEl.Descendants<Run>().FirstOrDefault(r => r.GetFirstChild<Text>() != null);
         if (enFirstRun?.RunProperties != null)
@@ -3293,9 +3317,15 @@ public partial class WordHandler
                 // phantom `width=…` key.
                 node.Format["_noTblW"] = true;
             }
-            // Alignment
-            if (tp.TableJustification?.Val?.Value != null)
-                node.Format["align"] = tp.TableJustification.Val.InnerText;
+            // Alignment. Read InnerText, never .Value — reading the enum .Value
+            // parses it, and a table <w:jc> written by other producers can carry
+            // an ISO/paragraph value (start / end / distribute / both) that the
+            // SDK's TableRowAlignmentValues enum (left/center/right) rejects. That
+            // FormatException crashed the entire get/query traversal under /body
+            // (#324). InnerText returns the raw token safely and round-trips.
+            var tblJcVal = tp.TableJustification?.Val;
+            if (tblJcVal != null && !string.IsNullOrEmpty(tblJcVal.InnerText))
+                node.Format["align"] = tblJcVal.InnerText;
             // Indent
             // BUG-R4B(BUG1): decimal-tolerant width read (w:tblInd w:w="0.0").
             // BUG-DUMP-R34-TBLIND: preserve the indent UNIT. A pct-typed tblInd

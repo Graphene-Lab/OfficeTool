@@ -534,8 +534,9 @@ public partial class WordHandler
                 var sectType = sectPr.GetFirstChild<SectionType>();
                 if (sectType == null)
                 {
+                    // CT_SectPr rank: w:type follows footnotePr/endnotePr (#467 class).
                     sectType = new SectionType();
-                    sectPr.PrependChild(sectType);
+                    InsertSectPrChildInOrder(sectPr, sectType);
                 }
                 sectType.Val = value.ToLowerInvariant() switch
                 {
