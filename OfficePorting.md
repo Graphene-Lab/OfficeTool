@@ -217,8 +217,10 @@ Note:
 - **NOTICE.md** nel pack: attribuzione Apache-2.0 — provenienza iOfficeAI/OfficeCLI
   v1.0.143, NOTICE upstream + link licenza.
 - **CI**: `.github/workflows/publish.yml` copiato da AllToMarkdown (pack `-c Release
-  -p:SkipNuGetPush=true` + `dotnet nuget push --api-key ${{ secrets.NUGET_API_KEY }}
-  --skip-duplicate` su push a master), puntando a `OfficeCliEngine.csproj`.
+  -p:SkipNuGetPush=true` + push su nuget.org), puntando a `OfficeCliEngine.csproj`.
+  Aggiornato il 2026-11-16: il workflow parte su un tag `v*`, non su un push a master, e non usa
+  più `secrets.NUGET_API_KEY` — la chiave è sostituita da `NuGet/login@v1` con
+  `permissions: id-token: write`, e su nuget.org serve una policy per repository.
 - **Dual-reference in AIOrchestrator**, come gli altri fratelli:
   ```xml
   <ProjectReference Include="..\OfficeCliEngine\OfficeCliEngine.csproj" Condition="Exists('..\OfficeCliEngine\OfficeCliEngine.csproj')" />
