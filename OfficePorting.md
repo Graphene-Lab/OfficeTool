@@ -1,5 +1,10 @@
 # OfficePorting — Linee guida per convertire officecli in OfficeTool.cs
 
+> **Aggiornamento 2026-11-19 — `WordTool` oggi si chiama `DocumentTool`.** Il rebrand è del
+> 2026-08-14: dove questo documento dice `WordTool`, `WordTool.Tests` o
+> `WordTool.AsyncTaskRegistry` si intende il tool di oggi — classe `DocumentTool`, progetto
+> `WordTool/DocumentTool.csproj`, test `DocumentTool.Tests`, pacchetto `Graphene.DocumentTool`.
+
 > **Aggiornamento 2026-08-20 — il backup `.NNN.bak` è stato sostituito dal versioning git.**
 > Le sezioni di questo documento che descrivono "backup numerato" / `Restore()` dal backup
 > sono **storiche**: oggi ogni `Save()`/`Create()` versiona il nuovo contenuto nel repo git
