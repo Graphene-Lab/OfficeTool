@@ -215,7 +215,7 @@ later decision (kept for history).
 ### D17. Agent-view test (2026-08-15)
 `[active]`
 - `OfficeTool.Tests --agent-view` dumps EXACTLY what the agent sees into
-  `out/agent-view-api.md` (`Analyzer.GeToolDefinitions` — one JSON tool per method with XML
+  `out/agent-view-api.md` (`Analyzer.GetToolDefinitions` — one JSON tool per method with XML
   docs) and `out/agent-view-cli.md` (`Terminal.GetToolPrompt` — the CLI-mode allowed-command
   block), and runs 82 deterministic checks: 37 methods present in both views, subcommand list
   complete, all returns string, no missing-summary fallback ("API call."), no sandbox mention,
